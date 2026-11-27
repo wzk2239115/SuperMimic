@@ -21,6 +21,7 @@ PATH_FIELDS = {
   "resume",
   "warm_start",
   "motion_cache_dir",
+  "motion_manifest",
 }
 
 

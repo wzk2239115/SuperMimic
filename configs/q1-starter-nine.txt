@@ -1,0 +1,10 @@
+# Nine retargeted LaFAN reference sequences. Paths are relative to motion_dir.
+simple_motion/walk1_subject2.npz
+complex_motion/walk2_subject4.npz
+complex_motion/walk3_subject2.npz
+simple_motion/walk4_subject1.npz
+complex_motion/run1_subject2.npz
+complex_motion/run2_subject1.npz
+complex_motion/jumps1_subject5.npz
+complex_motion/dance1_subject3.npz
+complex_motion/ground2_subject2.npz

@@ -55,6 +55,8 @@ class TrainCfg:
   motion_dir: Path
   output_dir: Path
   motion_pattern: str = "*.npz"
+  motion_manifest: Path | None = None
+  """Optional list of reference .npz paths relative to motion_dir."""
   max_motions: int = 8
   # An alphabetical prefix of a large library is one narrow slice of one corpus
   # -- the first few thousand BONES clips are neighbouring takes of the same
@@ -127,6 +129,27 @@ class TrainCfg:
   warm_start_progress: bool = False
   checkpoint_replay: bool = False
   resume_replay: bool = True
+
+
+def available_motions(cfg: TrainCfg) -> list[Path]:
+  if cfg.motion_manifest is None:
+    return sorted(cfg.motion_dir.glob(cfg.motion_pattern))
+  paths = []
+  seen: set[Path] = set()
+  for line in cfg.motion_manifest.read_text(encoding="utf-8").splitlines():
+    entry = line.partition("#")[0].strip()
+    if not entry:
+      continue
+    path = (cfg.motion_dir / entry).resolve()
+    if path.suffix != ".npz" or not path.is_relative_to(cfg.motion_dir.resolve()):
+      raise ValueError(f"Expected a .npz inside the motion directory: {entry}")
+    if path in seen or not path.is_file():
+      raise ValueError(f"Missing or duplicate motion in manifest: {entry}")
+    paths.append(path)
+    seen.add(path)
+  if not paths:
+    raise ValueError(f"No motions in {cfg.motion_manifest}")
+  return paths
 
 
 def select_motions(cfg: TrainCfg, available: list[Path]) -> list[Path]:
@@ -274,7 +297,7 @@ def _train(
       reward_scaling="q1_proportional" if cfg.q1_reward_scaling else None,
       modeled_action_delay=cfg.modeled_action_delay,
     ).to(cfg.device)
-    available = sorted(cfg.motion_dir.glob(cfg.motion_pattern))
+    available = available_motions(cfg)
     available_count = len(available)
     paths = select_motions(cfg, available)
     motions = Q1Motions(
