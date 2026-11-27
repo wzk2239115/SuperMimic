@@ -74,6 +74,8 @@ class TrainCfg:
   cpu_sim_workers: int = 1
   cpu_torch_threads: int = 4
   iterations: int = 20
+  max_wall_seconds: int = 0
+  """Stop after this elapsed time and save at the next safe boundary. Zero disables it."""
   replay_steps: int = 1000
   model_batch_size: int = 128
   policy_batch_size: int = 128
@@ -212,6 +214,15 @@ def train(cfg: TrainCfg) -> Path:
 def _train(
   cfg: TrainCfg, group: Distributed, requested: TrainCfg, stop: StopRequest
 ) -> Path:
+  if cfg.max_wall_seconds < 0:
+    raise ValueError("Maximum wall time must be nonnegative")
+  deadline = time.monotonic() + cfg.max_wall_seconds if cfg.max_wall_seconds else None
+
+  def stopping_requested() -> bool:
+    return group.any(
+      stop.requested or (deadline is not None and time.monotonic() >= deadline)
+    )
+
   if (
     min(
       cfg.num_envs,
@@ -838,6 +849,7 @@ def _train(
           "num_envs_per_rank": cfg.num_envs,
           "obs_dim": robot.obs_dim,
           "small_networks": cfg.small_networks,
+          "max_wall_seconds": cfg.max_wall_seconds,
         }
       ),
       flush=True,
@@ -845,7 +857,7 @@ def _train(
   try:
     # Warmup and extra collection are bounded; dense failures give a useful error.
     for _ in range(40):
-      if group.any(stop.requested):
+      if stopping_requested():
         return checkpoint(include_replay=True)
       with group.checked("warmup collection"):
         collect()
@@ -858,7 +870,7 @@ def _train(
         flush=True,
       )
     for iteration in range(start_iteration, cfg.iterations):
-      if group.any(stop.requested):
+      if stopping_requested():
         checkpoint(include_replay=True)
         break
       # Time only the last iterations, so lazy kernel compilation and the
@@ -984,7 +996,7 @@ def _train(
           print(json.dumps(metrics), flush=True)
       if profiler is not None and profiler.active:
         profiler.finish(local_env_steps)
-      stopping = group.any(stop.requested)
+      stopping = stopping_requested()
       if (
         (iteration + 1) % cfg.save_interval == 0
         or iteration + 1 == cfg.initial_save_iteration
@@ -994,6 +1006,10 @@ def _train(
       ):
         checkpoint(include_replay=stopping or iteration + 1 == cfg.iterations)
       if stopping:
+        if group.main:
+          print(
+            json.dumps({"stopped_after_checkpoint": completed_iteration}), flush=True
+          )
         break
   finally:
     if writer is not None:
