@@ -4,6 +4,7 @@ import json
 import sys
 from pathlib import Path
 
+import mujoco
 import numpy as np
 import torch
 
@@ -11,7 +12,29 @@ from supermimic.play import PlayCfg, play
 from supermimic.record import RecordCfg, diagnostic_summary, render_video
 
 
-def render(checkpoint: Path, output: Path, motion: int, seconds: int) -> None:
+def world_links(xml: Path, actual: np.ndarray, reference: np.ndarray) -> dict:
+  model = mujoco.MjModel.from_xml_path(str(xml))
+  data = mujoco.MjData(model)
+
+  def positions(track: np.ndarray) -> list:
+    result = []
+    for pose in track:
+      data.qpos[:] = pose
+      mujoco.mj_kinematics(model, data)
+      result.append(data.xpos.round(5).tolist())
+    return result
+
+  return {
+    "fps": 50,
+    "parents": model.body_parentid.tolist(),
+    "actual": positions(actual),
+    "reference": positions(reference),
+  }
+
+
+def render(
+  checkpoint: Path, output: Path, motion: int, seconds: int, mode: str
+) -> None:
   rollout = output / "rollout.npz"
   result = play(
     PlayCfg(
@@ -33,19 +56,26 @@ def render(checkpoint: Path, output: Path, motion: int, seconds: int) -> None:
 
   learner = torch.load(checkpoint, map_location="cpu", weights_only=True)
   xml = Path(learner["config"]["robot_xml"])
-  render_video(
-    RecordCfg(checkpoint, output, output, width=400, height=260),
-    xml,
-    actual,
-    reference,
-    summary["first_failure_frame"],
-    reference_first=True,
-  )
+  if mode == "links":
+    (output / "links.json").write_text(
+      json.dumps(
+        world_links(xml, actual, reference), separators=(",", ":"), allow_nan=False
+      )
+    )
+  else:
+    render_video(
+      RecordCfg(checkpoint, output, output, width=400, height=260),
+      xml,
+      actual,
+      reference,
+      summary["first_failure_frame"],
+      reference_first=True,
+    )
   (output / "effect.json").write_text(
     json.dumps(summary | {"motion": result["motion"]})
   )
 
 
 if __name__ == "__main__":
-  _, checkpoint, output, motion, seconds = sys.argv
-  render(Path(checkpoint), Path(output), int(motion), int(seconds))
+  _, checkpoint, output, motion, seconds, mode = sys.argv
+  render(Path(checkpoint), Path(output), int(motion), int(seconds), mode)

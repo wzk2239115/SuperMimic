@@ -16,11 +16,11 @@ p { margin: 0; color: #aebacb; }
 .labels { display: grid; grid-template-columns: 1fr 1fr; text-align: center; background: #1b2431; color: #d8e2f0; }
 .labels span { padding: 10px 8px; }
 .labels span + span { border-left: 1px solid #303947; }
-video { display: block; width: 100%; aspect-ratio: 800/292; background: #161c26; }
+video, canvas { display: block; width: 100%; aspect-ratio: 800/292; background: #161c26; }
 #waiting { min-height: 190px; display: grid; place-items: center; padding: 24px; text-align: center; }
 #waiting[hidden], [hidden] { display: none; }
 .controls { display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; align-items: center; margin: 14px 2px; }
-select { padding: 6px 8px; border-radius: 8px; border: 1px solid #424e5d; background: #202a37; font: inherit; }
+select, button { padding: 6px 8px; border-radius: 8px; border: 1px solid #424e5d; background: #202a37; font: inherit; }
 #status { margin: 14px 0; overflow-wrap: anywhere; }
 #status:empty { display: none; }
 dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 10px; margin: 16px 0 0; }
@@ -38,9 +38,14 @@ dd { margin: 4px 0 0; font-size: 20px; font-variant-numeric: tabular-nums; }
   <div class="labels"><span>参考动作</span><span>策略实际动作</span></div>
   <div id="waiting"><p>正在等待检查点或生成首段预览</p></div>
   <video id="video" controls autoplay muted loop playsinline hidden aria-label="参考动作与策略实际动作同步回放"></video>
+  <canvas id="links" width="800" height="292" hidden aria-label="参考和实际机器人连杆回放"></canvas>
 </div>
 <div class="controls" id="controls" hidden>
   <p id="caption"></p>
+  <div id="links-controls" hidden>
+    <button type="button" id="toggle">暂停</button>
+    <input id="scrubber" type="range" min="0" step="1" value="0" aria-label="回放进度">
+  </div>
   <label>速度
     <select id="speed"><option value="0.25">0.25 倍</option><option value="0.5" selected>0.5 倍</option><option value="1">1 倍</option></select>
   </label>
@@ -63,26 +68,114 @@ speed.addEventListener("change", () => { player.playbackRate = Number(speed.valu
 player.addEventListener("loadedmetadata", () => { player.playbackRate = Number(speed.value); });
 const degrees = r => (r * 180 / Math.PI).toFixed(1) + "°";
 
+const canvas = byId("links");
+const ctx = canvas.getContext("2d");
+const scrubber = byId("scrubber");
+const toggle = byId("toggle");
+let tracks = null;
+let frameTime = 0;
+let playing = true;
+let failureFrame = null;
+let lastFrameTime = 0;
+
+function paintLinks(frame) {
+  if (!tracks) return;
+  ctx.fillStyle = "#161c26";
+  ctx.fillRect(0, 0, 800, 292);
+  ctx.strokeStyle = "#465367";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(400, 0); ctx.lineTo(400, 292);
+  ctx.moveTo(0, 246); ctx.lineTo(800, 246);
+  ctx.stroke();
+  [tracks.reference[frame], tracks.actual[frame]].forEach((pose, panel) => {
+    const [rootX, rootY] = pose[1];
+    const project = ([x, y, z]) => {
+      const dx = x - rootX, dy = y - rootY;
+      return [200 + 400 * panel + 224 * (0.72 * dx - 0.69 * dy),
+              246 - 224 * (z + 0.32 * (0.69 * dx + 0.72 * dy))];
+    };
+    const points = pose.map(project);
+    const failed = panel === 1 && failureFrame != null && frame >= failureFrame;
+    ctx.strokeStyle = failed ? "#ff958a" : panel ? "#94baff" : "#90dac9";
+    ctx.fillStyle = ctx.strokeStyle;
+    ctx.lineCap = "round";
+    ctx.lineWidth = 5;
+    for (let i = 2; i < points.length; i++) {
+      const parent = tracks.parents[i];
+      if (!parent) continue;
+      ctx.beginPath();
+      ctx.moveTo(...points[parent]);
+      ctx.lineTo(...points[i]);
+      ctx.stroke();
+    }
+    for (let i = 1; i < points.length; i++) {
+      ctx.beginPath();
+      ctx.arc(...points[i], 3.4, 0, 2 * Math.PI);
+      ctx.fill();
+    }
+    ctx.font = "14px system-ui";
+    ctx.fillText(failed ? "已失稳" : (frame / tracks.fps).toFixed(2) + " s",
+                 15 + 400 * panel, 24);
+  });
+}
+toggle.addEventListener("click", () => {
+  playing = !playing;
+  toggle.textContent = playing ? "暂停" : "播放";
+});
+scrubber.addEventListener("input", () => {
+  if (!tracks) return;
+  frameTime = Number(scrubber.value);
+  paintLinks(frameTime);
+});
+function animate(now) {
+  if (tracks && !canvas.hidden && playing && lastFrameTime) {
+    frameTime = (frameTime + Math.min(now - lastFrameTime, 100) *
+      tracks.fps * Number(speed.value) / 1000) % tracks.reference.length;
+    const frame = Math.floor(frameTime);
+    scrubber.value = frame;
+    paintLinks(frame);
+  }
+  lastFrameTime = now;
+  requestAnimationFrame(animate);
+}
+requestAnimationFrame(animate);
+
 async function show(preview) {
-  const response = await fetch("./video/" + preview.checkpoint + ".mp4");
+  const linksMode = preview.render_mode === "links";
+  const route = linksMode ? "./links/" + preview.checkpoint + ".json"
+                          : "./video/" + preview.checkpoint + ".mp4";
+  const response = await fetch(route);
   if (!response.ok) return;
-  const nextUrl = URL.createObjectURL(await response.blob());
-  player.src = nextUrl;
-  if (videoUrl) URL.revokeObjectURL(videoUrl);
-  videoUrl = nextUrl;
+  if (linksMode) {
+    tracks = await response.json();
+    failureFrame = preview.first_failure_frame;
+    frameTime = 0;
+    scrubber.value = 0;
+    scrubber.max = tracks.reference.length - 1;
+    paintLinks(0);
+    player.pause();
+  } else {
+    const nextUrl = URL.createObjectURL(await response.blob());
+    player.src = nextUrl;
+    if (videoUrl) URL.revokeObjectURL(videoUrl);
+    videoUrl = nextUrl;
+  }
   checkpoint = preview.checkpoint;
   byId("waiting").hidden = true;
-  player.hidden = false;
+  player.hidden = linksMode;
+  canvas.hidden = !linksMode;
+  byId("links-controls").hidden = !linksMode;
   byId("controls").hidden = false;
   byId("metrics").hidden = false;
-  byId("caption").textContent = "第 " + checkpoint + " 轮 · " + preview.motion;
+  byId("caption").textContent = "第 " + checkpoint + " 轮 · " + preview.motion + (linksMode ? " · 连杆回放" : "");
   const failure = byId("failure");
   failure.textContent = preview.failed ? preview.first_failure_seconds.toFixed(2) + " 秒" : "未失稳";
   failure.classList.toggle("failure", preview.failed);
   byId("joints").textContent = degrees(preview.joint_angle_rmse_rad);
   byId("tilt").textContent = degrees(preview.root_orientation_rmse_rad);
   byId("duration").textContent = preview.duration_seconds.toFixed(1) + " 秒";
-  player.play().catch(() => {});
+  if (!linksMode) player.play().catch(() => {});
 }
 async function poll() {
   try {

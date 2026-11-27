@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Event, Thread
+from typing import Literal
 from urllib.parse import SplitResult, urlsplit
 
 import tyro
@@ -22,6 +23,8 @@ class Config:
   """Directory where the trainer writes checkpoints and metrics."""
   port: int = 8765
   """Local HTTP port. Use 0 to choose an available port."""
+  render_mode: Literal["auto", "video", "links"] = "auto"
+  """Video when available, or browser-drawn links without server OpenGL."""
   notebook_url: str | None = None
   """Current JupyterLab URL. Print the browser URL through its port proxy."""
   motion_index: int = 0
@@ -34,7 +37,8 @@ class Config:
 class Preview:
   checkpoint: int
   metadata: dict
-  video: bytes
+  asset: bytes
+  mode: Literal["video", "links"]
 
 
 def latest_checkpoint(run_dir: Path) -> tuple[int, Path] | None:
@@ -68,6 +72,7 @@ class RunPreview:
     self.rendering: int | None = None
     self.error: str | None = None
     self.stop = Event()
+    self.use_links = cfg.render_mode == "links"
 
   def watch(self) -> None:
     while not self.stop.is_set():
@@ -88,8 +93,28 @@ class RunPreview:
       self.stop.wait(4)
 
   def render(self, iteration: int, checkpoint: Path) -> None:
+    if not self.use_links and self.cfg.render_mode == "auto":
+      try:
+        self.ready = self.render_asset(iteration, checkpoint, "video")
+        return
+      except (OSError, RuntimeError, ValueError):
+        if self.stop.is_set():
+          return
+        print("Video unavailable; switching to browser-rendered links.", flush=True)
+        self.use_links = True
+    self.ready = self.render_asset(
+      iteration, checkpoint, "links" if self.use_links else "video"
+    )
+
+  def render_asset(
+    self, iteration: int, checkpoint: Path, mode: Literal["video", "links"]
+  ) -> Preview | None:
+    env = os.environ.copy()
+    if mode == "links":
+      env["MUJOCO_GL"] = "disable"
+      env.pop("PYOPENGL_PLATFORM", None)
     python = Path(sys.executable)
-    if sys.platform == "darwin":
+    if sys.platform == "darwin" and mode == "video":
       python = python.with_name("mjpython")
     with tempfile.TemporaryDirectory(prefix="supermimic-preview-") as directory:
       output = Path(directory)
@@ -104,7 +129,9 @@ class RunPreview:
             str(output),
             str(self.cfg.motion_index),
             str(self.cfg.seconds),
+            mode,
           ],
+          env=env,
           stdout=log,
           stderr=subprocess.STDOUT,
         ) as process,
@@ -114,7 +141,7 @@ class RunPreview:
             if process.poll() is not None:
               break
             if self.stop.wait(0.5):
-              return
+              return None
           if process.poll() is None:
             raise RuntimeError("Rendering did not finish within three minutes")
           if process.returncode:
@@ -128,10 +155,11 @@ class RunPreview:
               process.wait(timeout=3)
             except subprocess.TimeoutExpired:
               process.kill()
-      self.ready = Preview(
+      return Preview(
         iteration,
         json.loads((output / "effect.json").read_text()),
-        (output / "tracking.mp4").read_bytes(),
+        (output / ("tracking.mp4" if mode == "video" else "links.json")).read_bytes(),
+        mode,
       )
 
   def handler(self) -> type[BaseHTTPRequestHandler]:
@@ -151,11 +179,20 @@ class RunPreview:
             "error": preview.error,
             "preview": None
             if snapshot is None
-            else (snapshot.metadata | {"checkpoint": snapshot.checkpoint}),
+            else (
+              snapshot.metadata
+              | {"checkpoint": snapshot.checkpoint, "render_mode": snapshot.mode}
+            ),
           }
           self.send("application/json", json.dumps(status).encode())
-        elif snapshot is not None and path == f"/video/{snapshot.checkpoint}.mp4":
-          self.send("video/mp4", snapshot.video)
+        elif snapshot is not None and (
+          snapshot.mode == "video" and path == f"/video/{snapshot.checkpoint}.mp4"
+        ):
+          self.send("video/mp4", snapshot.asset)
+        elif snapshot is not None and (
+          snapshot.mode == "links" and path == f"/links/{snapshot.checkpoint}.json"
+        ):
+          self.send("application/json", snapshot.asset)
         else:
           self.send_error(404)
 

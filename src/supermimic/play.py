@@ -3,13 +3,12 @@
 import json
 import os
 import time
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
 import mujoco
-import mujoco.viewer
 import numpy as np
 import torch
 import tyro
@@ -125,11 +124,11 @@ def play(cfg: PlayCfg, *, cpu_threads: int = 4) -> PlayResult:
 
   simulator.reset(ids, motion[:1], cfg.randomize)
   states.append(simulator.state()[0].cpu().numpy())
-  window = (
-    mujoco.viewer.launch_passive(simulator.cpu_models[0], simulator.cpu_data[0])
-    if show
-    else nullcontext()
-  )
+  window: AbstractContextManager[Any] = nullcontext()
+  if show:
+    from mujoco import viewer
+
+    window = viewer.launch_passive(simulator.cpu_models[0], simulator.cpu_data[0])
   with window as handle:
     for _ in range(cfg.loops):
       if loops:
