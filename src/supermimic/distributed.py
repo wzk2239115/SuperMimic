@@ -16,7 +16,7 @@ leaves every call a no-op, so the single-GPU and CPU paths stay unchanged.
 
 import os
 from collections.abc import Generator, Iterable, Sequence
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import timedelta
 from functools import reduce
@@ -25,6 +25,8 @@ from typing import Any, Literal
 import torch
 import torch.distributed as dist
 from torch import Tensor
+
+from supermimic.cuda_diagnostics import CudaDiagnostics
 
 
 @dataclass
@@ -47,6 +49,7 @@ class Distributed:
   # Set by `initialize`; collectives on bookkeeping tensors stage through it.
   device: str = "cpu"
   validation_mode: Literal["per_minibatch", "per_update"] = "per_minibatch"
+  cuda_diagnostics: CudaDiagnostics | None = field(default=None, init=False, repr=False)
   _update_failure: Tensor | None = field(default=None, init=False, repr=False)
   _failure_checks: list[tuple[Tensor, str]] = field(
     default_factory=list, init=False, repr=False
@@ -342,7 +345,16 @@ class Distributed:
       [p.grad if p.grad is not None else torch.zeros_like(p) for p in bucket]
       for bucket in plan.buckets
     ]
-    self._reduce_gradient_buckets(gradients, plan.flat_buffers)
+    with self.timed("gradient_exchange"):
+      self._reduce_gradient_buckets(gradients, plan.flat_buffers)
+
+  def timed(self, label: str) -> AbstractContextManager[None]:
+    profiler = self.cuda_diagnostics
+    return (
+      profiler.timed(label)
+      if profiler is not None and profiler.active
+      else nullcontext()
+    )
 
   def _reduce_gradient_buckets(
     self, buckets: list[list[Tensor]], buffers: list[Tensor] | None = None

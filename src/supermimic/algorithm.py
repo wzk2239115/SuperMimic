@@ -318,48 +318,49 @@ class SuperMimic:
 
   def fit_model_tensors(self, batch: ReplayBatch) -> dict[str, Tensor]:
     """Keep diagnostics on device until the complete model update ends."""
-    state = batch.states[:, 0]
-    context = batch.context
-    targets = self.motions.sequence(
-      batch.clips,
-      batch.frames,
-      torch.arange(1, batch.actions.shape[1] + 1, device=batch.frames.device),
-    )
-    state_losses, term_losses = [], []
-    self.model_optimizer.zero_grad(set_to_none=True)
-    for t in range(batch.actions.shape[1]):
-      valid = None if batch.valid is None else batch.valid[:, t]
-      action, target = batch.actions[:, t], targets[:, t]
-      label, terminated = batch.next_states[:, t], batch.terminated[:, t]
-      if valid is not None:
-        # Inactive suffixes cannot feed an unbounded imagined rollout or NaNs
-        # through autograd. Only the valid real prefix contributes gradients.
-        state = torch.where(valid[:, None], state, batch.states[:, 0])
-        context = torch.where(valid[:, None], context, batch.context)
-        action = torch.where(valid[:, None], action, 0)
-        target = torch.where(valid[:, None], target, targets[:, 0])
-        label = torch.where(valid[:, None], label, batch.states[:, 0])
-        terminated = torch.where(valid, terminated, 0)
-      if self.fuse_model_loss:
-        state, state_loss, term_loss = self.model_loss_step(
-          state, action, context, target, label, terminated, valid
-        )
-      else:
-        state, logits = self.model_step(state, action, context, target)
-        state_loss, term_loss = self._model_losses(
-          state, logits, label, terminated, valid
-        )
-      state_losses.append(state_loss)
-      term_losses.append(term_loss)
-      context = self.model.advance_context(context, action)
-    state_loss = torch.stack(state_losses).sum()
-    term_loss = torch.stack(term_losses).sum()
-    if self.normalize_model_objective:
-      state_loss = state_loss / batch.actions.shape[1]
-      term_loss = term_loss / batch.actions.shape[1]
-    loss = state_loss + term_loss
-    self.distributed.require_finite(loss, "Nonfinite world-model loss")
-    loss.backward()
+    with self.distributed.timed("model_forward_backward"):
+      state = batch.states[:, 0]
+      context = batch.context
+      targets = self.motions.sequence(
+        batch.clips,
+        batch.frames,
+        torch.arange(1, batch.actions.shape[1] + 1, device=batch.frames.device),
+      )
+      state_losses, term_losses = [], []
+      self.model_optimizer.zero_grad(set_to_none=True)
+      for t in range(batch.actions.shape[1]):
+        valid = None if batch.valid is None else batch.valid[:, t]
+        action, target = batch.actions[:, t], targets[:, t]
+        label, terminated = batch.next_states[:, t], batch.terminated[:, t]
+        if valid is not None:
+          # Inactive suffixes cannot feed an unbounded imagined rollout or NaNs
+          # through autograd. Only the valid real prefix contributes gradients.
+          state = torch.where(valid[:, None], state, batch.states[:, 0])
+          context = torch.where(valid[:, None], context, batch.context)
+          action = torch.where(valid[:, None], action, 0)
+          target = torch.where(valid[:, None], target, targets[:, 0])
+          label = torch.where(valid[:, None], label, batch.states[:, 0])
+          terminated = torch.where(valid, terminated, 0)
+        if self.fuse_model_loss:
+          state, state_loss, term_loss = self.model_loss_step(
+            state, action, context, target, label, terminated, valid
+          )
+        else:
+          state, logits = self.model_step(state, action, context, target)
+          state_loss, term_loss = self._model_losses(
+            state, logits, label, terminated, valid
+          )
+        state_losses.append(state_loss)
+        term_losses.append(term_loss)
+        context = self.model.advance_context(context, action)
+      state_loss = torch.stack(state_losses).sum()
+      term_loss = torch.stack(term_losses).sum()
+      if self.normalize_model_objective:
+        state_loss = state_loss / batch.actions.shape[1]
+        term_loss = term_loss / batch.actions.shape[1]
+      loss = state_loss + term_loss
+      self.distributed.require_finite(loss, "Nonfinite world-model loss")
+      loss.backward()
     self.distributed.average_gradients(self.model.parameters())
     model_norm = torch.nn.utils.clip_grad_norm_(
       self.model.parameters(),
@@ -367,7 +368,8 @@ class SuperMimic:
       error_if_nonfinite=self.distributed.validation_mode == "per_minibatch",
     )
     self.distributed.require_finite(model_norm, "Nonfinite world-model gradient norm")
-    self.model_optimizer.step()
+    with self.distributed.timed("model_optimizer"):
+      self.model_optimizer.step()
     return {
       "model_loss": loss.detach(),
       "state_loss": state_loss.detach(),
@@ -561,7 +563,8 @@ class SuperMimic:
     # Graph execution has no collectives or host validity reads. Coordinate
     # allocation/capture failures before all ranks enter gradient averaging.
     with self.distributed.checked("captured imagination"):
-      output = self.imagination_graph.run(batch)
+      with self.distributed.timed("actor_rollout_and_backward"):
+        output = self.imagination_graph.run(batch)
     self.distributed.require_finite(output.loss, "Nonfinite imagined return")
     actor_norm = self._update_actor()
     critic_loss = self._fit_critic(
@@ -595,7 +598,8 @@ class SuperMimic:
     for p in self.actor.parameters():
       if p.grad is not None:
         p.grad.clamp_(-0.1, 0.1)
-    self.actor_optimizer.step()
+    with self.distributed.timed("actor_optimizer"):
+      self.actor_optimizer.step()
     return actor_norm
 
   def _critic_loss_step(
@@ -625,11 +629,12 @@ class SuperMimic:
       order = torch.randperm(len(x), device=x.device)
       for ids in order.tensor_split(min(critic_minibatches, len(order))):
         self.critic_optimizer.zero_grad(set_to_none=True)
-        critic_loss = self.critic_loss_step(
-          x[ids], g[ids], ctx[ids], y[ids], weight[ids]
-        )
-        self.distributed.require_finite(critic_loss, "Nonfinite critic loss")
-        critic_loss.backward()
+        with self.distributed.timed("critic_forward_backward"):
+          critic_loss = self.critic_loss_step(
+            x[ids], g[ids], ctx[ids], y[ids], weight[ids]
+          )
+          self.distributed.require_finite(critic_loss, "Nonfinite critic loss")
+          critic_loss.backward()
         self.distributed.average_gradients(self.critic.parameters())
         critic_norm = torch.nn.utils.clip_grad_norm_(
           self.critic.parameters(),
@@ -637,6 +642,7 @@ class SuperMimic:
           error_if_nonfinite=self.distributed.validation_mode == "per_minibatch",
         )
         self.distributed.require_finite(critic_norm, "Nonfinite critic gradient norm")
-        self.critic_optimizer.step()
+        with self.distributed.timed("critic_optimizer"):
+          self.critic_optimizer.step()
         critic_losses.append(critic_loss.detach())
     return torch.stack(critic_losses).mean()

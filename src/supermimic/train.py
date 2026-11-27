@@ -27,6 +27,7 @@ from supermimic.checkpoint import (
   save_checkpoint,
 )
 from supermimic.collection import Q1Collector
+from supermimic.cuda_diagnostics import CudaDiagnostics, summarize_ranks
 from supermimic.data import Q1Motions, ReturnResetSampler
 from supermimic.distributed import Distributed
 from supermimic.imagination_terminal import MIN_SURVIVAL, TERMINAL_HANDLING
@@ -100,6 +101,7 @@ class TrainCfg:
   seed: int = 0
   profile_iterations: int = 0
   profile_every: int = 0
+  profile_cuda_ranks: bool = False
   compile_networks: bool = False
   compile_collection: bool = False
   fuse_model_loss: bool = False
@@ -212,6 +214,12 @@ def _train(
     raise ValueError("Allow a positive motion state budget")
   if cfg.profile_every < 0 or not 0 <= cfg.profile_iterations <= cfg.iterations:
     raise ValueError("Profile at most every iteration of this run")
+  if cfg.profile_cuda_ranks and (
+    not cfg.device.startswith("cuda") or not cfg.profile_iterations
+  ):
+    raise ValueError("Per-rank CUDA diagnostics require CUDA and profile_iterations")
+  profiler = CudaDiagnostics(cfg.device) if cfg.profile_cuda_ranks else None
+  group.cuda_diagnostics = profiler
   mps = cfg.device == "mps"
   if mps:
     if not torch.backends.mps.is_available():
@@ -459,17 +467,20 @@ def _train(
     references = collection_motions.sequence(
       clips, frames, torch.arange(1, 11, device=collection_device)
     )
-    action = collector.action(history, references)
+    with group.timed("collector_actor"):
+      action = collector.action(history, references)
     executed = action + cfg.action_noise * torch.randn_like(action)
-    next_state = simulator.step(executed)
-    reward, terminated, observation = collector.heads(
-      state,
-      next_state,
-      references[:, 0],
-      action if cfg.clean_policy_actions else executed,
-      simulator.context,
-      history[:, -1, -22:] if cfg.clean_policy_actions else None,
-    )
+    with group.timed("physics_step"):
+      next_state = simulator.step(executed)
+    with group.timed("collector_heads"):
+      reward, terminated, observation = collector.heads(
+        state,
+        next_state,
+        references[:, 0],
+        action if cfg.clean_policy_actions else executed,
+        simulator.context,
+        history[:, -1, -22:] if cfg.clean_policy_actions else None,
+      )
     boundary = terminated | (frames + 1 >= length_device[clips] - 1)
     replay.add(
       state,
@@ -482,17 +493,20 @@ def _train(
       clips,
       frames,
     )
-    trace_bins = sampler.bin_ids(clips, frames).tolist()
-    trace_ceilings = sampler.frame_ceiling(clips, frames).tolist()
+    with group.timed("collection_readback"):
+      trace_bins = sampler.bin_ids(clips, frames).tolist()
+      trace_ceilings = sampler.frame_ceiling(clips, frames).tolist()
+      rewards = reward.cpu().tolist()
     for index, (bin_id, ceiling, value) in enumerate(
-      zip(trace_bins, trace_ceilings, reward.cpu().tolist(), strict=True)
+      zip(trace_bins, trace_ceilings, rewards, strict=True)
     ):
       episode_traces[index].append((bin_id, ceiling, value))
     frames.add_(1)
     local_env_steps += cfg.num_envs
     observation += torch.randn_like(observation) * physics_robot.noise_scale()
     history.copy_(torch.cat((history[:, 1:], observation[:, None]), 1))
-    ids = boundary.nonzero().flatten()
+    with group.timed("find_reset_ids"):
+      ids = boundary.nonzero().flatten()
     if len(ids):
       for index in ids.tolist():
         future = 0.0
@@ -500,7 +514,8 @@ def _train(
           future = value + 0.99 * future
           pending_bins.append(bin_id)
           pending_progress.append(future / ceiling)
-      reset(ids)
+      with group.timed("reset_worlds"):
+        reset(ids)
     return float(reward.mean())
 
   def flush_curriculum() -> None:
@@ -831,6 +846,8 @@ def _train(
       profiling = iteration >= cfg.iterations - cfg.profile_iterations or bool(
         cfg.profile_every and iteration > 0 and iteration % cfg.profile_every == 0
       )
+      if profiler is not None and iteration >= cfg.iterations - cfg.profile_iterations:
+        profiler.begin(local_env_steps)
       with phase("collect"):
         # 0.4 updates per collected control step: alternate 2 and 3 steps.
         with group.checked("collection"):
@@ -942,6 +959,8 @@ def _train(
           for name, value in metrics.items():
             writer.add_scalar(name, value, iteration + 1)
           print(json.dumps(metrics), flush=True)
+      if profiler is not None and profiler.active:
+        profiler.finish(local_env_steps)
       stopping = group.any(stop.requested)
       if (
         (iteration + 1) % cfg.save_interval == 0
@@ -956,19 +975,41 @@ def _train(
   finally:
     if writer is not None:
       writer.close()
+  rank_summary = {}
+  if profiler is not None and profiler.iterations:
+    local_profile = profiler.result(group.rank)
+    local_profile["phase_wall_ms_per_iteration"] = {
+      name: 1000 * seconds / profiler.iterations
+      for name, seconds in phase_seconds.items()
+    }
+    ranks = group.objects(local_profile)
+    if group.main:
+      rank_summary = summarize_ranks(ranks)
+      (cfg.output_dir / "rank_performance.json").write_text(
+        json.dumps({"summary": rank_summary, "ranks": ranks}, indent=2) + "\n"
+      )
   if cfg.profile_iterations and phase_seconds and group.main:
     total = sum(phase_seconds.values())
     report = {
-      "profiled_iterations": cfg.profile_iterations,
+      "profiled_iterations": profiler.iterations
+      if profiler is not None
+      else cfg.profile_iterations,
       "device": cfg.device,
       "ranks": group.world_size,
       "num_envs": cfg.num_envs * group.world_size,
       "small_networks": cfg.small_networks,
       "seconds_per_iteration": {
-        name: value / cfg.profile_iterations for name, value in phase_seconds.items()
+        name: value
+        / (profiler.iterations if profiler is not None else cfg.profile_iterations)
+        for name, value in phase_seconds.items()
       },
       "share": {name: value / total for name, value in phase_seconds.items()},
     }
+    if rank_summary:
+      report["env_steps_per_second"] = rank_summary["env_steps_per_second"]
+      report["min_sampled_device_free_gib"] = rank_summary[
+        "min_sampled_device_free_gib"
+      ]
     (cfg.output_dir / "throughput.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report), flush=True)
   return cfg.output_dir / f"checkpoint_{completed_iteration}.pt"

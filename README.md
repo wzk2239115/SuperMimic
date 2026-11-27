@@ -192,6 +192,13 @@ export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
 
 默认从 Yuanke 动作库选 16 段动作。只训练某一段舞时，把配置复制到同一目录并修改 `motion_dir`、`motion_pattern` 和 `max_motions`。首次运行确认首轮捕获成功，并用后续训练日志中的阶段耗时、仿真步数和显存余量调优。本配置的八卡实测应在目标服务器完成。
 
+### 逐卡诊断与采样规模
+
+`a6000-8gpu-diag-4096.example.toml` 和 `a6000-8gpu-diag-8192.example.toml` 各跑 12 轮，只改变环境数量。
+末 8 轮的实际步数和耗时用于 `throughput.json` 中的 `env_steps_per_second`。
+`rank_performance.json` 保存每卡采集、世界模型、策略耗时和 CUDA 分段计时，以及 PyTorch 峰值显存和采样时观察到的最小设备空闲显存。
+CUDA stream 时间可能包含等待和空闲，不能当作 CUDA 核函数运行时间之和。诊断不会在每个子段单独调用设备同步。
+
 ### 复用已有 PyTorch 的 CUDA 容器
 
 对于已提供 CUDA 版 PyTorch 的容器（例如 Python 3.12 和 CUDA 12.8 的 NVIDIA 镜像），可以使用容器内的 Python 和 PyTorch，从源码启动。以下安装只写入当前仓库里的虚拟环境。
