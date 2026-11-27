@@ -12,6 +12,10 @@ import tyro
 from PIL import Image, ImageDraw
 from tensorboard.compat.proto.event_pb2 import Event
 from tensorboard.compat.proto.summary_pb2 import Summary
+from tensorboard.compat.proto.tensor_pb2 import TensorProto
+from tensorboard.compat.proto.tensor_shape_pb2 import TensorShapeProto
+from tensorboard.compat.proto.types_pb2 import DT_STRING
+from tensorboard.plugins.image.metadata import create_summary_metadata
 from tensorboard.summary.writer.event_file_writer import EventFileWriter
 
 from supermimic.preview import latest_checkpoint
@@ -93,17 +97,19 @@ def main() -> None:
   folder.mkdir(parents=True, exist_ok=True)
   target = folder / f"checkpoint_{iteration}_motion_{cfg.motion_index}.gif"
   target.write_bytes(gif)
-  log_dir = cfg.run_dir / "tensorboard" / "preview"
+  log_dir = cfg.run_dir / "tensorboard" / "preview-images"
   tag = f"rollout/motion_{cfg.motion_index}"
   summary = Summary(
     value=[
       Summary.Value(
         tag=tag,
-        image=Summary.Image(
-          height=HEIGHT,
-          width=WIDTH,
-          colorspace=3,
-          encoded_image_string=gif,
+        metadata=create_summary_metadata(
+          display_name=tag, description="Reference and actual MuJoCo rollout"
+        ),
+        tensor=TensorProto(
+          dtype=DT_STRING,
+          tensor_shape=TensorShapeProto(dim=[TensorShapeProto.Dim(size=3)]),
+          string_val=[str(WIDTH).encode(), str(HEIGHT).encode(), gif],
         ),
       )
     ]
@@ -115,3 +121,4 @@ def main() -> None:
     writer.close()
   print(f"动作回放 GIF: {target.resolve()}", flush=True)
   print(f"TensorBoard Images: {tag} (step {iteration})", flush=True)
+  print(f"TensorBoard Log Dir: {log_dir.resolve()}", flush=True)
