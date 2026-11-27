@@ -240,6 +240,40 @@ class Q1Robot(nn.Module):
       "ctrl_limits", torch.tensor(m.actuator_ctrlrange, dtype=torch.float32)
     )
 
+    # Group independent branches so each tree level uses one tensor operation
+    # per transform, rather than launching a separate operation for each link.
+    self._kinematic_levels: list[tuple[int, int]] = []
+    if self.parents[1] == 0 and all(
+      self.parents[b] > 0 and len(self.body_joints[b]) <= 1 for b in range(2, m.nbody)
+    ):
+      levels = [[1]]
+      while children := [b for b in range(2, m.nbody) if self.parents[b] in levels[-1]]:
+        levels.append(children)
+      order = [b for level in levels for b in level]
+      if len(order) == m.nbody - 1:
+        parent_rows = [
+          levels[depth - 1].index(self.parents[b])
+          for depth, level in enumerate(levels)
+          if depth
+          for b in level
+        ]
+        joints = [next(iter(self.body_joints[b]), 0) for b in order[1:]]
+        for name, indices in (
+          ("_fk_bodies", order[1:]),
+          ("_fk_parents", parent_rows),
+          ("_fk_joints", joints),
+          ("_fk_qindices", [max(0, self.qindexes[j]) for j in joints]),
+          ("_fk_restore", [0, *[1 + order.index(b) for b in range(1, m.nbody)]]),
+        ):
+          self.register_buffer(
+            name, torch.tensor(indices, dtype=torch.long), persistent=False
+          )
+        start = 0
+        for level in levels[1:]:
+          self._kinematic_levels.append((start, start + len(level)))
+          start += len(level)
+        self._fk_centered = not np.any(m.jnt_pos[joints])
+
   def reward_identity(self) -> dict[str, str | float | int | None]:
     """Expose resolved values for config/identity and comparison across runs."""
     return asdict(self.reward_scaling)
@@ -299,6 +333,68 @@ class Q1Robot(nn.Module):
 
   def kinematics(self, state: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Return link-origin position, WXYZ rotation, world linear/angular velocity."""
+    if not self._kinematic_levels:
+      return self._kinematics_serial(state)
+    p = state[..., None, :3]
+    r = normalize_quat(state[..., None, 3:7])
+    v = state[..., None, 29:32]
+    w = state[..., None, 32:35]
+    zero = torch.zeros_like(p)
+    identity = state.new_tensor([1, 0, 0, 0]).expand_as(r)
+    positions, rotations, velocities, angular = (
+      [zero, p],
+      [identity, r],
+      [zero, v],
+      [zero, w],
+    )
+    positions_local = self.body_pos.index_select(0, self._fk_bodies)
+    rotations_local = self.body_quat.index_select(0, self._fk_bodies)
+    axes_local = self.joint_axis.index_select(0, self._fk_joints)
+    axes_local = axes_local * (self._fk_joints != 0).unsqueeze(-1)
+    half = 0.5 * (
+      state[..., 7:29].index_select(-1, self._fk_qindices)
+      - self.default_q.index_select(0, self._fk_qindices)
+    )
+    half = half * (self._fk_joints != 0)
+    joint_rotation = torch.cat(
+      (half.cos().unsqueeze(-1), half.sin().unsqueeze(-1) * axes_local), -1
+    )
+    combined_rotation = quat_mul(
+      rotations_local.expand_as(joint_rotation), joint_rotation
+    )
+    local_speed = state[..., 35:57].index_select(-1, self._fk_qindices)
+    local_omega = quat_apply(rotations_local, axes_local) * local_speed.unsqueeze(-1)
+    if not self._fk_centered:
+      anchors = self.joint_anchor.index_select(0, self._fk_joints)
+    for start, end in self._kinematic_levels:
+      parent = self._fk_parents[start:end]
+      parent_r = r.index_select(-2, parent)
+      offset = quat_apply(parent_r, positions_local[start:end])
+      p = p.index_select(-2, parent) + offset
+      w = w.index_select(-2, parent)
+      v = v.index_select(-2, parent) + torch.linalg.cross(w, offset)
+      r = quat_mul(parent_r, combined_rotation[..., start:end, :])
+      joint_w = quat_apply(parent_r, local_omega[..., start:end, :])
+      if not self._fk_centered:
+        anchor = anchors[start:end]
+        before = quat_apply(parent_r, quat_apply(rotations_local[start:end], anchor))
+        after = quat_apply(r, anchor)
+        move = before - after
+        p = p + move
+        v = v + torch.linalg.cross(w, move) - torch.linalg.cross(joint_w, after)
+      w = w + joint_w
+      positions.append(p)
+      rotations.append(r)
+      velocities.append(v)
+      angular.append(w)
+    return (
+      torch.cat(positions, -2).index_select(-2, self._fk_restore),
+      torch.cat(rotations, -2).index_select(-2, self._fk_restore),
+      torch.cat(velocities, -2).index_select(-2, self._fk_restore),
+      torch.cat(angular, -2).index_select(-2, self._fk_restore),
+    )
+
+  def _kinematics_serial(self, state: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     shape = state.shape[:-1]
     zero = state.new_zeros((*shape, 3))
     identity = state.new_tensor([1, 0, 0, 0]).expand(*shape, 4)

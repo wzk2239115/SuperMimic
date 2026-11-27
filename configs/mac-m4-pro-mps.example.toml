@@ -1,0 +1,30 @@
+# M4 Pro / 48 GB: CPU MuJoCo and MPS learner. Paths resolve from this file.
+[train]
+robot_xml = "../assets/q1_v3/xml/q1_v3_mc.xml"
+motion_dir = "../datasets/train_50hz/motion_yuanke"
+motion_pattern = "*/*.npz"
+motion_cache_dir = "../logs/mac_motion_cache"
+output_dir = "../logs/mac_m4_pro_mps_train"
+device = "mps"
+max_motions = 16
+motion_selection = "random"
+motion_storage = "device"
+motion_memory_gb = 16.0
+num_envs = 128
+cpu_sim_workers = 4
+cpu_torch_threads = 4
+iterations = 10000
+replay_steps = 1000
+model_batch_size = 2048
+policy_batch_size = 2048
+model_batches = 2
+critic_epochs = 2
+critic_minibatches = 2
+learning_rate = 0.0002
+physics_timestep = 0.002
+save_interval = 500
+initial_save_iteration = 20
+cache_reference_heads = true
+cache_goals = true
+time_major_rollout = true
+profile_every = 100

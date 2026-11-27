@@ -32,6 +32,12 @@ class Config:
   """Number of visible GPUs/ranks; global env/batch counts are not multiplied."""
   dry_run: bool = False
   """Print the resolved command without creating a run or initializing CUDA."""
+  output_dir: Path | None = None
+  """Override the training output directory, relative to the shell."""
+  webui: bool = False
+  """Serve the current run's action preview on this computer."""
+  webui_port: int = 8765
+  """Local preview port. Use 0 to select an available port."""
   compiler_cache_dir: Path | None = None
   """Compiler/temp root; defaults to local /tmp/supermimic-<uid>."""
 
@@ -117,13 +123,43 @@ def runtime_environment(cache_dir: Path | None = None) -> dict[str, str]:
 
 def main() -> None:
   cfg = tyro.cli(Config)
-  command = build_command(load_options(cfg.config), cfg.gpus)
+  options = load_options(cfg.config)
+  if cfg.output_dir is not None:
+    options["output_dir"] = str(cfg.output_dir.expanduser().resolve())
+  command = build_command(options, cfg.gpus)
   print(shlex.join(command), flush=True)
+  dashboard = None
+  if cfg.webui:
+    if not 0 <= cfg.webui_port <= 65535:
+      raise ValueError("Choose a WebUI port between 0 and 65535")
+    dashboard = [
+      sys.executable,
+      "-m",
+      "supermimic.preview",
+      "--run-dir",
+      str(options["output_dir"]),
+      "--port",
+      str(cfg.webui_port),
+    ]
+    print(f"WebUI: {shlex.join(dashboard)}", flush=True)
   if cfg.dry_run:
     return
   environment = runtime_environment(cfg.compiler_cache_dir)
   print(f"Compiler cache: {environment['TORCHINDUCTOR_CACHE_DIR']}", flush=True)
-  subprocess.run(command, env=environment, check=True)
+  if dashboard is None:
+    subprocess.run(command, env=environment, check=True)
+    return
+
+  # The preview server has its own session so Ctrl+C goes to the training job first.
+  with subprocess.Popen(dashboard, env=environment, start_new_session=True) as webui:
+    try:
+      subprocess.run(command, env=environment, check=True)
+    finally:
+      webui.terminate()
+      try:
+        webui.wait(timeout=5)
+      except subprocess.TimeoutExpired:
+        webui.kill()
 
 
 if __name__ == "__main__":

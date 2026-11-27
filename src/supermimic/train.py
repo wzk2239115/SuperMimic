@@ -37,7 +37,7 @@ from supermimic.models import (
 )
 from supermimic.normalization import MLPPrecision, NetworkProfile, RunningNorm
 from supermimic.randomization import RandomizationCfg
-from supermimic.replay import TemporalReplay
+from supermimic.replay import ReplayBatch, TemporalReplay
 from supermimic.reward_tuning import RewardTuningCfg
 from supermimic.robot import Q1Robot
 from supermimic.simulator import Q1Simulator
@@ -68,6 +68,8 @@ class TrainCfg:
   # GPU and the same run on eight are the same experiment. Each must divide by
   # the rank count.
   num_envs: int = 8
+  cpu_sim_workers: int = 1
+  cpu_torch_threads: int = 4
   iterations: int = 20
   replay_steps: int = 1000
   model_batch_size: int = 128
@@ -103,6 +105,7 @@ class TrainCfg:
   fuse_model_loss: bool = False
   cache_reference_heads: bool = False
   cache_goals: bool = False
+  time_major_rollout: bool = False
   capture_reset: bool = False
   capture_imagination: bool = False
   compile_critic: bool = False
@@ -143,10 +146,12 @@ def rank_configuration(
   cfg: TrainCfg, group: Distributed, visible_gpus: int
 ) -> TrainCfg:
   """Resolve auto separately from an explicit CPU request, then split totals."""
-  if cfg.device not in ("cpu", "auto") and not cfg.device.startswith("cuda"):
-    raise ValueError("Use auto, CPU MuJoCo or CUDA MuJoCo Warp")
+  if cfg.device not in ("cpu", "mps", "auto") and not cfg.device.startswith("cuda"):
+    raise ValueError("Use auto, cpu, mps or cuda")
   if cfg.device == "auto":
     cfg = replace(cfg, device="cuda:0" if visible_gpus else "cpu")
+  if cfg.device == "mps" and group.enabled:
+    raise ValueError("MPS training requires one process")
   if group.enabled:
     # The launcher assigns the GPU; a device in the config would make every rank
     # crowd onto the same one. An explicit CPU device is left alone, so the
@@ -199,14 +204,29 @@ def _train(
     raise ValueError("Counts, batches and intervals must be positive")
   if cfg.model_warmup_iterations < 0:
     raise ValueError("Model warmup must be nonnegative")
+  if cfg.cpu_torch_threads < 1 or cfg.cpu_sim_workers < 1:
+    raise ValueError("CPU worker and Torch thread counts must be positive")
   if cfg.replay_steps < 10 or cfg.max_motions < 0 or cfg.learning_rate <= 0:
     raise ValueError("Invalid replay size, motion limit or learning rate")
   if cfg.motion_memory_gb <= 0:
     raise ValueError("Allow a positive motion state budget")
   if cfg.profile_every < 0 or not 0 <= cfg.profile_iterations <= cfg.iterations:
     raise ValueError("Profile at most every iteration of this run")
-  if cfg.device != "cpu" and not cfg.device.startswith("cuda"):
-    raise ValueError("Use CPU MuJoCo or CUDA MuJoCo Warp")
+  mps = cfg.device == "mps"
+  if mps:
+    if not torch.backends.mps.is_available():
+      raise RuntimeError("MPS is unavailable in this process")
+    if any(
+      (
+        cfg.compile_networks,
+        cfg.compile_collection,
+        cfg.capture_imagination,
+        cfg.capture_reset,
+      )
+    ):
+      raise ValueError("MPS training uses eager execution without graph capture")
+    if cfg.mlp_precision != "fp32":
+      raise ValueError("Select fp32 for MPS training")
   if cfg.action_noise < 0 or cfg.action_scale <= 0:
     raise ValueError("Invalid Q1 action noise or scale")
   if cfg.runtime_checks not in ("per_minibatch", "per_update"):
@@ -236,8 +256,8 @@ def _train(
   # networks from the same seed, and only afterwards offsets its own stream so
   # the ranks do not simulate the same environments.
   torch.manual_seed(cfg.seed)
-  if cfg.device == "cpu":
-    torch.set_num_threads(min(torch.get_num_threads(), 4))
+  if cfg.device == "cpu" or mps:
+    torch.set_num_threads(cfg.cpu_torch_threads)
   else:
     torch.backends.cuda.matmul.allow_tf32 = True
   with group.checked("Q1 assets and motion preparation"):
@@ -303,6 +323,7 @@ def _train(
       distributed=group,
       cache_reference_heads=cfg.cache_reference_heads,
       cache_goals=cfg.cache_goals,
+      time_major_rollout=cfg.time_major_rollout,
       fuse_model_loss=cfg.fuse_model_loss,
       reward_tuning=reward_tuning,
       clean_policy_actions=cfg.clean_policy_actions,
@@ -314,25 +335,47 @@ def _train(
     )
     if cfg.compile_networks:
       algorithm.enable_compile()
+  collection_device = "cpu" if mps else cfg.device
+  with group.checked("simulator and replay allocation"):
+    physics_robot = robot
+    collection_actor = actor
+    collection_motions = motions
+    if mps:
+      physics_robot = Q1Robot(
+        cfg.robot_xml,
+        reward_scaling="q1_proportional" if cfg.q1_reward_scaling else None,
+        modeled_action_delay=cfg.modeled_action_delay,
+      )
+      collection_actor = MotionPolicy(
+        physics_robot,
+        actor_hidden,
+        activation=cfg.network_activation,
+        network_profile=cfg.network_profile,
+      )
+      if motions.device != "cpu":
+        collection_motions = Q1Motions(
+          physics_robot, paths, storage="shared", cache_dir=cfg.motion_cache_dir
+        )
+        collection_motions.prepare()
     collector = Q1Collector(
-      robot,
-      actor,
+      physics_robot,
+      collection_actor,
       motions.dt,
       reward_tuning=reward_tuning,
       clean_policy_actions=cfg.clean_policy_actions,
     )
     if cfg.compile_collection:
       collector.enable_compile()
-  with group.checked("simulator and replay allocation"):
     simulator = Q1Simulator(
-      robot,
+      physics_robot,
       cfg.num_envs,
-      cfg.device,
+      collection_device,
       cfg.action_scale,
       randomization=RandomizationCfg(),
       use_tn=cfg.use_tn,
       physics_timestep=cfg.physics_timestep,
       capture_reset=cfg.capture_reset,
+      cpu_sim_workers=cfg.cpu_sim_workers,
     )
     replay = TemporalReplay(
       cfg.replay_steps,
@@ -340,10 +383,10 @@ def _train(
       robot.state_dim,
       robot.context_dim,
       robot.obs_dim,
-      cfg.device,
+      collection_device,
     )
-  history = torch.empty(cfg.num_envs, 10, robot.obs_dim, device=cfg.device)
-  clips = torch.empty(cfg.num_envs, dtype=torch.long, device=cfg.device)
+  history = torch.empty(cfg.num_envs, 10, robot.obs_dim, device=collection_device)
+  clips = torch.empty(cfg.num_envs, dtype=torch.long, device=collection_device)
   frames = torch.empty_like(clips)
   # Each step keeps the bin it belongs to and the ceiling of its own frame, so a
   # return observed late in a clip is not measured against what a frame a second
@@ -353,7 +396,7 @@ def _train(
   ]
   pending_bins: list[int] = []
   pending_progress: list[float] = []
-  length_device = lengths.to(cfg.device)
+  length_device = lengths.to(collection_device)
   local_env_steps = int(rank_state.get("local_env_steps", 0)) if rank_state else 0
   # Phase attribution puts an explicit device barrier on each boundary, so the
   # reported seconds are comparable to one another but sum to slightly more
@@ -367,25 +410,41 @@ def _train(
     if not profiling:
       yield
       return
-    if cfg.device != "cpu":
+    if mps:
+      torch.mps.synchronize()
+    elif cfg.device.startswith("cuda"):
       torch.cuda.synchronize(cfg.device)
     start = time.perf_counter()
     yield
-    if cfg.device != "cpu":
+    if mps:
+      torch.mps.synchronize()
+    elif cfg.device.startswith("cuda"):
       torch.cuda.synchronize(cfg.device)
     elapsed = time.perf_counter() - start
     iteration_phases[name] = iteration_phases.get(name, 0.0) + elapsed
     if iteration >= cfg.iterations - cfg.profile_iterations:
       phase_seconds[name] = phase_seconds.get(name, 0.0) + elapsed
 
+  def sync_collection_actor() -> None:
+    if mps:
+      collection_actor.load_state_dict(actor.state_dict())
+
+  def sample(batch_size: int, window: int, history: int) -> ReplayBatch:
+    batch = replay.sample(batch_size, window, history)
+    return batch.to(cfg.device) if mps else batch
+
   def reset(ids: torch.Tensor) -> None:
     c, f, _ = sampler.sample(len(ids))
-    c, f = c.to(cfg.device), f.to(cfg.device)
-    reference = motions.sequence(c, f, torch.tensor([0], device=cfg.device))[:, 0]
+    c, f = c.to(collection_device), f.to(collection_device)
+    reference = collection_motions.sequence(
+      c, f, torch.zeros(1, dtype=torch.long, device=collection_device)
+    )[:, 0]
     simulator.reset(ids, reference, cfg.randomize)
     clips[ids], frames[ids] = c, f
-    observation = robot.observation(simulator.state()[ids], simulator.context[ids])
-    observation += torch.randn_like(observation) * robot.noise_scale()
+    observation = physics_robot.observation(
+      simulator.state()[ids], simulator.context[ids]
+    )
+    observation += torch.randn_like(observation) * physics_robot.noise_scale()
     history[ids] = observation[:, None].expand(-1, 10, -1)
     for index in ids.tolist():
       episode_traces[index].clear()
@@ -394,10 +453,12 @@ def _train(
   def collect() -> float:
     nonlocal local_env_steps
     state = simulator.state()
-    context = (
-      simulator.context.clone() if cfg.modeled_action_delay else simulator.context
+    context = simulator.context
+    if cfg.modeled_action_delay:
+      context = context.clone()
+    references = collection_motions.sequence(
+      clips, frames, torch.arange(1, 11, device=collection_device)
     )
-    references = motions.sequence(clips, frames, torch.arange(1, 11, device=cfg.device))
     action = collector.action(history, references)
     executed = action + cfg.action_noise * torch.randn_like(action)
     next_state = simulator.step(executed)
@@ -429,7 +490,7 @@ def _train(
       episode_traces[index].append((bin_id, ceiling, value))
     frames.add_(1)
     local_env_steps += cfg.num_envs
-    observation += torch.randn_like(observation) * robot.noise_scale()
+    observation += torch.randn_like(observation) * physics_robot.noise_scale()
     history.copy_(torch.cat((history[:, 1:], observation[:, None]), 1))
     ids = boundary.nonzero().flatten()
     if len(ids):
@@ -481,12 +542,12 @@ def _train(
       "imagination_terminal_handling": TERMINAL_HANDLING,
       "imagination_min_survival": MIN_SURVIVAL,
     },
-    "physics_timestep": robot.model.opt.timestep,
-    "xml_timestep": robot.model.opt.timestep,
+    "physics_timestep": physics_robot.model.opt.timestep,
+    "xml_timestep": physics_robot.model.opt.timestep,
     "solver_tolerance": (
       float(simulator.warp_model.opt.tolerance.numpy().reshape(-1)[0])
       if cfg.device.startswith("cuda")
-      else robot.model.opt.tolerance
+      else physics_robot.model.opt.tolerance
     ),
     "source_file_sha256": {
       path.name: hashlib.sha256(path.read_bytes()).hexdigest()
@@ -497,6 +558,7 @@ def _train(
       for name in ("torch", "mujoco", "mujoco-warp", "warp-lang", "numpy")
     }
     | {"python": platform.python_version()},
+    "collection_device": collection_device,
     "device_name": (
       torch.cuda.get_device_name(cfg.device)
       if cfg.device.startswith("cuda")
@@ -677,7 +739,8 @@ def _train(
     np.random.seed(rank_seed % 2**32)
     if rank_state is not None:
       restore_rng(rank_state["rng"], cfg.device)
-    reset(torch.arange(cfg.num_envs, device=cfg.device))
+    sync_collection_actor()
+    reset(torch.arange(cfg.num_envs, device=collection_device))
   with group.checked("run creation"):
     if group.main:
       cfg.output_dir.mkdir(parents=True, exist_ok=False)
@@ -771,6 +834,7 @@ def _train(
       with phase("collect"):
         # 0.4 updates per collected control step: alternate 2 and 3 steps.
         with group.checked("collection"):
+          sync_collection_actor()
           collection_reward = sum(collect() for _ in range(2 + iteration % 2)) / (
             2 + iteration % 2
           )
@@ -780,11 +844,9 @@ def _train(
         with group.checked("replay readiness"):
           for attempt in range(500):
             try:
-              model_batch = replay.sample(cfg.model_batch_size, window=8, history=1)
+              model_batch = sample(cfg.model_batch_size, window=8, history=1)
               if actor_update:
-                policy_batch = replay.sample(
-                  cfg.policy_batch_size, window=1, history=10
-                )
+                policy_batch = sample(cfg.policy_batch_size, window=1, history=10)
               break
             except ValueError:
               if attempt == 499:
@@ -810,8 +872,7 @@ def _train(
       if cfg.runtime_checks == "per_update":
         with group.checked("model replay sampling"):
           staged_batches = [model_batch] + [
-            replay.sample(cfg.model_batch_size, 8, 1)
-            for _ in range(cfg.model_batches - 1)
+            sample(cfg.model_batch_size, 8, 1) for _ in range(cfg.model_batches - 1)
           ]
       group.begin_update()
       with phase("model"):
@@ -820,11 +881,7 @@ def _train(
             batch = staged_batches[update]
           else:
             with group.checked("model replay sampling"):
-              batch = (
-                model_batch
-                if update == 0
-                else replay.sample(cfg.model_batch_size, 8, 1)
-              )
+              batch = model_batch if update == 0 else sample(cfg.model_batch_size, 8, 1)
           model_tensors = algorithm.fit_model_tensors(batch)
         model_metrics = {name: float(value) for name, value in model_tensors.items()}
       with phase("policy"):
@@ -832,7 +889,10 @@ def _train(
         if actor_update:
           assert policy_batch is not None
           metrics = metrics | algorithm.improve_policy(
-            policy_batch, cfg.critic_epochs, cfg.critic_minibatches
+            policy_batch,
+            cfg.critic_epochs,
+            cfg.critic_minibatches,
+            profile_mps=profiling and mps,
           )
         metrics["actor_update"] = float(actor_update)
       group.validate_update()
@@ -864,6 +924,9 @@ def _train(
       metrics.update(
         {f"{name}_seconds": value for name, value in iteration_phases.items()}
       )
+      if profiling and mps:
+        metrics["mps_allocated_gib"] = torch.mps.current_allocated_memory() / 1024**3
+        metrics["mps_driver_gib"] = torch.mps.driver_allocated_memory() / 1024**3
       if profiling and cfg.device.startswith("cuda"):
         metrics["torch_allocated_gib"] = (
           torch.cuda.memory_allocated(cfg.device) / 1024**3

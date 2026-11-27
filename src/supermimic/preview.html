@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SuperMimic · 训练回放</title>
+<style>
+:root { color-scheme: dark; font: 15px/1.55 system-ui, sans-serif; color: #ebeff6; background: #11151c; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+main { max-width: 1080px; margin: 0 auto; padding: 28px clamp(16px, 5vw, 48px) 56px; }
+header { display: flex; gap: 20px; justify-content: space-between; align-items: end; flex-wrap: wrap; margin-bottom: 22px; }
+h1 { font-size: clamp(26px, 4vw, 38px); line-height: 1.12; letter-spacing: -.04em; margin: 0 0 8px; }
+p { margin: 0; color: #aebacb; }
+#progress { font-variant-numeric: tabular-nums; color: #b8e5dc; }
+.screen { position: relative; border: 1px solid #303947; border-radius: 16px; overflow: hidden; background: #171e28; }
+.labels { display: grid; grid-template-columns: 1fr 1fr; text-align: center; background: #1b2431; color: #d8e2f0; }
+.labels span { padding: 10px 8px; }
+.labels span + span { border-left: 1px solid #303947; }
+video { display: block; width: 100%; aspect-ratio: 800/292; background: #161c26; }
+#waiting { min-height: 190px; display: grid; place-items: center; padding: 24px; text-align: center; }
+#waiting[hidden], [hidden] { display: none; }
+.controls { display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; align-items: center; margin: 14px 2px; }
+select { padding: 6px 8px; border-radius: 8px; border: 1px solid #424e5d; background: #202a37; font: inherit; }
+#status { margin: 14px 0; overflow-wrap: anywhere; }
+#status:empty { display: none; }
+dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 10px; margin: 16px 0 0; }
+dl > div { padding: 14px; border-radius: 12px; border: 1px solid #303947; background: #171e28; }
+dt { font-size: 13px; color: #aebacb; }
+dd { margin: 4px 0 0; font-size: 20px; font-variant-numeric: tabular-nums; }
+.failure { color: #ffb1a8; }
+</style>
+<main>
+<header>
+  <div><h1>Q1 训练回放</h1><p>SuperMimic · 新检查点保存后自动更新</p></div>
+  <p id="progress">等待读取训练进度</p>
+</header>
+<div class="screen">
+  <div class="labels"><span>参考动作</span><span>策略实际动作</span></div>
+  <div id="waiting"><p>正在等待检查点或生成首段预览</p></div>
+  <video id="video" controls autoplay muted loop playsinline hidden aria-label="参考动作与策略实际动作同步回放"></video>
+</div>
+<div class="controls" id="controls" hidden>
+  <p id="caption"></p>
+  <label>速度
+    <select id="speed"><option value="0.25">0.25 倍</option><option value="0.5" selected>0.5 倍</option><option value="1">1 倍</option></select>
+  </label>
+</div>
+<p id="status" role="status"></p>
+<dl id="metrics" hidden>
+  <div><dt>首次失稳</dt><dd id="failure">—</dd></div>
+  <div><dt>关节角误差</dt><dd id="joints">—</dd></div>
+  <div><dt>躯干姿态误差</dt><dd id="tilt">—</dd></div>
+  <div><dt>回放时长</dt><dd id="duration">—</dd></div>
+</dl>
+</main>
+<script>
+const byId = id => document.getElementById(id);
+const player = byId("video");
+const speed = byId("speed");
+let checkpoint = null;
+let videoUrl = null;
+speed.addEventListener("change", () => { player.playbackRate = Number(speed.value); });
+player.addEventListener("loadedmetadata", () => { player.playbackRate = Number(speed.value); });
+const degrees = r => (r * 180 / Math.PI).toFixed(1) + "°";
+
+async function show(preview) {
+  const response = await fetch("/video/" + preview.checkpoint + ".mp4");
+  if (!response.ok) return;
+  const nextUrl = URL.createObjectURL(await response.blob());
+  player.src = nextUrl;
+  if (videoUrl) URL.revokeObjectURL(videoUrl);
+  videoUrl = nextUrl;
+  checkpoint = preview.checkpoint;
+  byId("waiting").hidden = true;
+  player.hidden = false;
+  byId("controls").hidden = false;
+  byId("metrics").hidden = false;
+  byId("caption").textContent = "第 " + checkpoint + " 轮 · " + preview.motion;
+  const failure = byId("failure");
+  failure.textContent = preview.failed ? preview.first_failure_seconds.toFixed(2) + " 秒" : "未失稳";
+  failure.classList.toggle("failure", preview.failed);
+  byId("joints").textContent = degrees(preview.joint_angle_rmse_rad);
+  byId("tilt").textContent = degrees(preview.root_orientation_rmse_rad);
+  byId("duration").textContent = preview.duration_seconds.toFixed(1) + " 秒";
+  player.play().catch(() => {});
+}
+async function poll() {
+  try {
+    const response = await fetch("/status");
+    if (!response.ok) throw new Error("Unavailable");
+    const data = await response.json();
+    byId("progress").textContent = data.iteration == null ? "等待训练日志" : "最新记录 · 第 " + data.iteration + " 轮";
+    byId("status").textContent = data.error || (data.rendering == null ? "" : "正在生成第 " + data.rendering + " 轮回放…");
+    if (data.preview && data.preview.checkpoint !== checkpoint) await show(data.preview);
+  } catch {
+    byId("status").textContent = "预览服务暂时不可用，正在重新连接…";
+  } finally {
+    setTimeout(poll, 3000);
+  }
+}
+poll();
+</script>
+</html>

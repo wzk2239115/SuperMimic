@@ -1,6 +1,6 @@
 """Per-environment temporal replay with terminal next states kept before reset."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any
 
 import torch
@@ -18,6 +18,15 @@ class ReplayBatch:
   clips: Tensor
   frames: Tensor
   valid: Tensor | None = None
+
+  def to(self, device: str) -> "ReplayBatch":
+    tensors = {field.name: getattr(self, field.name) for field in fields(self)}
+    return ReplayBatch(
+      **{
+        name: tensor.to(device) if tensor is not None else None
+        for name, tensor in tensors.items()
+      }
+    )
 
 
 class TemporalReplay:

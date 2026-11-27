@@ -1,5 +1,8 @@
 """Autoregressive model fitting and analytic short-horizon actor-critic."""
 
+import time
+from typing import cast
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -64,9 +67,11 @@ class SuperMimic:
     capture_imagination: bool = False,
     compile_critic: bool = False,
     fused_optimizers: bool = False,
+    time_major_rollout: bool = False,
   ):
     self.robot, self.motions = robot, motions
     self.model, self.actor, self.critic = model, actor, critic
+    self.time_major_rollout = time_major_rollout
     self.horizon = horizon
     self.reward_tuning = reward_tuning
     self.clean_policy_actions = clean_policy_actions
@@ -366,10 +371,26 @@ class SuperMimic:
     }
 
   def improve_policy(
-    self, batch: ReplayBatch, critic_epochs: int = 5, critic_minibatches: int = 4
+    self,
+    batch: ReplayBatch,
+    critic_epochs: int = 5,
+    critic_minibatches: int = 4,
+    *,
+    profile_mps: bool = False,
   ) -> dict[str, float]:
     if self.imagination_graph is not None and batch.states.is_cuda:
       return self._improve_policy_captured(batch, critic_epochs, critic_minibatches)
+    timings: dict[str, float] = {}
+    started = time.perf_counter() if profile_mps else 0.0
+
+    def mark(name: str) -> None:
+      nonlocal started
+      if profile_mps:
+        torch.mps.synchronize()
+        now = time.perf_counter()
+        timings[f"policy_{name}_seconds"] = now - started
+        started = now
+
     h = self.horizon
     references = self.motions.sequence(
       batch.clips, batch.frames, torch.arange(h + 11, device=batch.frames.device)
@@ -389,6 +410,20 @@ class SuperMimic:
           head.reshape(len(references), h, *head.shape[1:])
           for head in self.reference_kinematics(flat)
         )
+    time_major = self.time_major_rollout and cached_goals is not None
+    if time_major:
+      rollout_targets = references[:, 1 : h + 1].transpose(0, 1).contiguous()
+      rollout_heads = (
+        tuple(head.transpose(0, 1).contiguous() for head in reference_heads)
+        if reference_heads is not None
+        else None
+      )
+      rollout_encodings = (
+        encodings.transpose(0, 1).contiguous() if encodings is not None else None
+      )
+    else:
+      rollout_targets = rollout_heads = rollout_encodings = None
+    noise_scale = self.robot.noise_scale() if time_major else None
     state, history = batch.states[:, 0].detach(), batch.history.detach()
     context = batch.context
     initial_state, initial_history, initial_context = state, history, context
@@ -400,6 +435,7 @@ class SuperMimic:
     self.actor_optimizer.zero_grad(set_to_none=True)
     self.model_optimizer.zero_grad(set_to_none=True)
     self.critic_optimizer.zero_grad(set_to_none=True)
+    mark("prepare")
     with frozen(self.model, self.critic):
       for t in range(h):
         state, history, context, active = absorbing_inputs(
@@ -412,27 +448,39 @@ class SuperMimic:
           initial_context,
         )
         weights.append(torch.where(active, survival.detach(), 0))
+        if rollout_targets is not None:
+          target = rollout_targets[t, :, None]
+          heads = (
+            tuple(head[t] for head in rollout_heads)
+            if rollout_heads is not None
+            else None
+          )
+          encoding = rollout_encodings[t] if rollout_encodings is not None else None
+        else:
+          target = references[
+            :, t + 1 : t + (2 if self.cache_goals else 11)
+          ].contiguous()
+          heads = (
+            tuple(head[:, t].contiguous() for head in reference_heads)
+            if reference_heads is not None
+            else None
+          )
+          encoding = encodings[:, t].contiguous() if encodings is not None else None
         next_state, reward, termination, observation, goal, value = self.imagined_step(
           state,
           history,
-          references[:, t + 1 : t + (2 if self.cache_goals else 11)].contiguous(),
+          target,
           context,
-          (
-            reference_heads[0][:, t].contiguous(),
-            reference_heads[1][:, t].contiguous(),
-            reference_heads[2][:, t].contiguous(),
-            reference_heads[3][:, t].contiguous(),
-          )
-          if reference_heads is not None
-          else None,
+          cast(tuple[Tensor, Tensor, Tensor, Tensor] | None, heads),
           cached_goals[:, t] if cached_goals is not None else None,
-          encodings[:, t].contiguous() if encodings is not None else None,
+          encoding,
           active,
         )
         states.append(state.detach())
         contexts.append(context.detach())
-        goals.append(goal.detach())
-        values.append(value)
+        if not time_major:
+          goals.append(goal.detach())
+        values.append(value.detach())
         # A reference ending is a known finite horizon, not a fall label.
         termination = torch.where(
           remaining <= t + 1, torch.ones_like(termination), termination
@@ -441,8 +489,8 @@ class SuperMimic:
         survival = survival * (1 - termination)
         rewards.append(reward)
         terminations.append(termination)
-        observation = (
-          observation + torch.randn_like(observation) * self.robot.noise_scale()
+        observation = observation + torch.randn_like(observation) * (
+          self.robot.noise_scale() if noise_scale is None else noise_scale
         )
         history = torch.cat((history[:, 1:], observation[:, None]), dim=1)
         state = next_state
@@ -458,21 +506,28 @@ class SuperMimic:
         initial_context,
       )
       survival = torch.where(active, survival, 0)
-      values.append(torch.where(active, self.critic(state, final_goal, context), 0))
-      objective = objective + self.gamma**h * survival * values[-1]
+      final_value = torch.where(active, self.critic(state, final_goal, context), 0)
+      objective = objective + self.gamma**h * survival * final_value
       loss = -objective.mean()
       if self.normalize_policy_objective:
         loss = loss / h
       self.distributed.require_finite(loss, "Nonfinite imagined return")
+      mark("rollout")
       loss.backward()
     actor_norm = self._update_actor()
-    returns = gae_returns(
-      torch.stack(rewards, 1), torch.stack(terminations, 1), torch.stack(values, 1)
-    )
+    mark("actor_backward")
     x = torch.stack(states, 1).flatten(0, 1)
-    g = torch.stack(goals, 1).flatten(0, 1)
+    g = (
+      cached_goals.detach()
+      if time_major and cached_goals is not None
+      else torch.stack(goals, 1)
+    ).flatten(0, 1)
     ctx = torch.stack(contexts, 1).flatten(0, 1)
     weights_tensor = torch.stack(weights, 1)
+    value_targets = torch.stack([*values, final_value.detach()], 1)
+    rollout_rewards = torch.stack(rewards, 1).detach()
+    returns = gae_returns(rollout_rewards, torch.stack(terminations, 1), value_targets)
+    mark("targets")
     critic_loss = self._fit_critic(
       x,
       g,
@@ -482,13 +537,12 @@ class SuperMimic:
       critic_epochs,
       critic_minibatches,
     )
-    return {
+    mark("critic_fit")
+    return timings | {
       "actor_loss": float(loss.detach()),
       "actor_grad_norm": float(actor_norm),
       "critic_loss": float(critic_loss),
-      "imagined_reward": float(
-        surviving_reward_mean(torch.stack(rewards, 1).detach(), weights_tensor)
-      ),
+      "imagined_reward": float(surviving_reward_mean(rollout_rewards, weights_tensor)),
       "imagination_survival_fraction": float(weights_tensor.mean()),
       "critic_target_abs_max": float(returns.abs().max()),
     }

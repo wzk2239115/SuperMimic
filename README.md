@@ -8,7 +8,7 @@
 
 ## 安装
 
-Linux、Python 3.13；GPU 训练需要 NVIDIA CUDA。
+Python 3.13。Linux 使用 NVIDIA CUDA，Apple Silicon 可使用 CPU MuJoCo 和 MPS。
 
 ```bash
 git clone https://code.iqiyuan-robot.com/sw/SuperMimic-Q1.git
@@ -150,6 +150,48 @@ uv run --no-sync supermimic watch-videos   --run-dir logs/q1_fresh   --motion-di
 ```
 
 使用 NVIDIA GPU 无屏绘图时，可为 watcher 添加 `--render-device 0`。
+
+## CUDA 单卡与八卡对照
+
+`configs/cuda-bench.example.toml` 用仓库自带的模型与一条固定参考动作跑 30 轮。环境数和批量是全局总量，两次运行保持一致。先确认 CUDA 能看到 8 张卡，再分别启动：
+
+```bash
+nvidia-smi -L
+nvidia-smi topo -m
+uv sync --python 3.13 --no-dev
+.venv/bin/python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.device_count()); assert torch.cuda.device_count() >= 8'
+RUN_TAG=$(date +%Y%m%d-%H%M%S)
+for CARDS in 1 8; do
+  .venv/bin/supermimic launch --config configs/cuda-bench.example.toml \
+    --gpus "$CARDS" --output-dir "logs/a6000-${RUN_TAG}-${CARDS}gpu" || break
+done
+```
+
+比较两个输出目录里的 `throughput.json` 和 `metrics.jsonl`。短测先验证兼容性和固定工作量下的扩展效率，下一步可为多卡调大总环境数并按同一动作的跟踪效果评估收益。
+
+## Apple Silicon 训练
+
+在 M4 Pro / 48 GB Mac 上可用 `configs/mac-m4-pro-mps.example.toml`。MuJoCo、动作采集和经验回放使用 CPU，世界模型、策略和价值网络在 MPS 上更新。启动器的 `--gpus 1` 表示单进程，设备由配置中的 `device = "mps"` 选择。
+
+```sh
+uv sync --python 3.13 --no-dev
+cp configs/mac-m4-pro-mps.example.toml configs/mac-local.toml
+.venv/bin/supermimic launch --config configs/mac-local.toml --gpus 1
+```
+
+配置使用 128 个仿真环境和 2048 批量。每次新运行使用新的 `output_dir`。续训时设置 `resume` 为检查点路径，同时保留对应的 `.ranks` 目录，并将 `iterations` 设为累计目标轮数。各阶段耗时和 MPS 驱动内存会在指定轮次写入 `metrics.jsonl`。策略阶段还会记录参考数据准备、想象 rollout、策略反向传播、价值目标计算和价值网络拟合的耗时。Mac 配置启用 `time_major_rollout`，在进入循环前一次性排列参考张量，减少每步复制。
+
+在该机 1024 批量对照中，MPS 每轮采集、模型和策略阶段合计约 1.83 秒，CPU 约 3.24 秒。MPS 在 2048 批量时约 2.65 秒，4096 批量时约 6.04 秒。2048 在这组测试中每秒处理的策略样本最多，驱动报告内存约 11 GiB；4096 约占 22 GiB。小批量或当前进程无法访问 Metal 时，可以使用 `configs/mac-m4-pro.example.toml` 的 CPU 配置。
+
+### 网页动作预览
+
+启动新训练时加 `--webui`。训练已经在跑时，可在另一个终端启动独立预览：
+
+```sh
+.venv/bin/python -m supermimic preview --run-dir logs/mac_m4_pro_mps_train
+```
+
+打开 [http://127.0.0.1:8765](http://127.0.0.1:8765)。左侧播放参考动作，右侧播放策略在 MuJoCo 中的实际表现。底部标记首次失稳时间和跟踪误差。默认使用固定的第一条动作，回放前 6 秒，并随新检查点更新。可用 `--motion-index`、`--seconds` 和 `--port` 调整独立预览。回放需要 FFmpeg，Apple Silicon 使用虚拟环境里的 `mjpython` 渲染。TensorBoard 可单独用 `tensorboard --logdir <运行目录>/tensorboard` 打开。
 
 ## 开发
 

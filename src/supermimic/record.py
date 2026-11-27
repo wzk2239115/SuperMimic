@@ -119,6 +119,8 @@ def render_video(
   actual: np.ndarray,
   reference: np.ndarray,
   first_failure: int | None,
+  *,
+  reference_first: bool = False,
 ) -> int:
   executable = shutil.which(cfg.ffmpeg)
   if executable is None:
@@ -183,8 +185,10 @@ def render_video(
         renderer.update_scene(data, camera=camera)
         right = renderer.render().copy()
         image = Image.new("RGB", (2 * cfg.width, cfg.height + 32))
-        image.paste(Image.fromarray(left), (0, 32))
-        image.paste(Image.fromarray(right), (cfg.width, 32))
+        policy_x = cfg.width if reference_first else 0
+        reference_x = 0 if reference_first else cfg.width
+        image.paste(Image.fromarray(left), (policy_x, 32))
+        image.paste(Image.fromarray(right), (reference_x, 32))
         draw = ImageDraw.Draw(image)
         failed = first_failure is not None and frame >= first_failure
         drift = float(np.linalg.norm(pose[:2] - target[:2]))
@@ -192,8 +196,9 @@ def render_video(
           f"POLICY  t={frame / 50:.2f}s  XY={drift:.2f}m  "
           f"{'FAILED' if failed else 'TRACKING'}"
         )
-        draw.text((8, 8), text, fill="red" if failed else "white")
-        draw.text((cfg.width + 8, 8), "LAFAN REFERENCE", fill="white")
+        draw.text((policy_x + 8, 8), text, fill="red" if failed else "white")
+        label = "REFERENCE" if reference_first else "LAFAN REFERENCE"
+        draw.text((reference_x + 8, 8), label, fill="white")
         if frame == 0:
           image.save(cfg.output_dir / "preview.png")
         process.stdin.write(image.tobytes())

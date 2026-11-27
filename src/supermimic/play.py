@@ -52,6 +52,8 @@ class PlayCfg:
   """Draw one episode of domain randomization instead of the nominal model."""
   stop_on_failure: bool = True
   """Stop at the paper's termination thresholds instead of playing on."""
+  max_steps: int | None = None
+  """Limit each playback loop to this many simulation steps."""
 
 
 def display_available() -> bool:
@@ -59,9 +61,11 @@ def display_available() -> bool:
 
 
 @torch.no_grad()
-def play(cfg: PlayCfg) -> PlayResult:
+def play(cfg: PlayCfg, *, cpu_threads: int = 4) -> PlayResult:
   if cfg.speed <= 0 or cfg.loops < 1:
     raise ValueError("Playback speed must be positive and loops at least one")
+  if cfg.max_steps is not None and cfg.max_steps < 1:
+    raise ValueError("Playback step limit must be positive")
   if cfg.motion_index < 0:
     raise ValueError("Motion index must be nonnegative")
   show = display_available() if cfg.viewer == "auto" else cfg.viewer == "on"
@@ -74,7 +78,7 @@ def play(cfg: PlayCfg) -> PlayResult:
     )
   if cfg.output is not None and cfg.output.exists():
     raise FileExistsError(f"{cfg.output} exists; pick a path that does not")
-  torch.set_num_threads(min(torch.get_num_threads(), 4))
+  torch.set_num_threads(min(torch.get_num_threads(), cpu_threads))
   checkpoint = torch.load(cfg.checkpoint, map_location=cfg.device, weights_only=True)
   config, identity = checkpoint["config"], checkpoint["identity"]
   robot = Q1Robot(
@@ -133,7 +137,10 @@ def play(cfg: PlayCfg) -> PlayResult:
       loops += 1
       observation = robot.observation(simulator.state(), simulator.context)
       history = observation[:, None].expand(-1, 10, -1).clone()
-      for frame in range(len(motion) - 1):
+      steps = len(motion) - 1
+      if cfg.max_steps is not None:
+        steps = min(steps, cfg.max_steps)
+      for frame in range(steps):
         if handle is not None and not handle.is_running():
           break
         clock = time.perf_counter()

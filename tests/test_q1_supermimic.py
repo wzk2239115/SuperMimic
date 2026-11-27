@@ -187,6 +187,18 @@ def test_fk_matches_mujoco_link_positions_and_velocities(robot: Q1Robot):
   np.testing.assert_allclose(w[0].numpy(), numerical_w.numpy(), atol=1e-5)
 
 
+def test_batched_fk_preserves_gradients(robot: Q1Robot):
+  state = sample_state(robot, 6).reshape(2, 3, -1).requires_grad_()
+  actual = robot.kinematics(state)
+  expected = robot._kinematics_serial(state)
+  weights = tuple(torch.randn_like(value) for value in expected)
+  for result, reference in zip(actual, expected, strict=True):
+    torch.testing.assert_close(result, reference, atol=2e-5, rtol=2e-5)
+  (actual_grad,) = torch.autograd.grad(actual, state, weights)
+  (expected_grad,) = torch.autograd.grad(expected, state, weights)
+  torch.testing.assert_close(actual_grad, expected_grad, atol=2e-5, rtol=2e-5)
+
+
 def test_perfect_reward_and_pose_gradient(robot: Q1Robot):
   state = sample_state(robot, 2)
   action = state[:, 57:79]

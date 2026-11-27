@@ -1,6 +1,7 @@
 """Direct Q1 XML simulation; CPU MuJoCo and GPU MuJoCo Warp collectors."""
 
 import copy
+from concurrent.futures import ThreadPoolExecutor
 
 import mujoco
 import mujoco_warp as mw
@@ -101,8 +102,16 @@ class Q1Simulator:
     use_tn: bool = True,
     physics_timestep: float | None = None,
     capture_reset: bool = False,
+    cpu_sim_workers: int = 1,
   ):
+    if cpu_sim_workers < 1:
+      raise ValueError("CPU simulation workers must be positive")
     self.robot, self.num_envs, self.device = robot, num_envs, device
+    self.cpu_executor = (
+      ThreadPoolExecutor(max_workers=cpu_sim_workers)
+      if device == "cpu" and cpu_sim_workers > 1
+      else None
+    )
     self.action_scale = action_scale
     self.use_tn = use_tn
     self.capture_reset = capture_reset
@@ -433,7 +442,9 @@ class Q1Simulator:
       peaks = self.torque_peaks.numpy()
       knees = self.torque_knees.numpy()
       slope = peaks / (self.torque_cutoffs.numpy() - knees)
-      for i, (m, d) in enumerate(zip(self.cpu_models, self.cpu_data, strict=True)):
+
+      def step_world(i: int) -> None:
+        m, d = self.cpu_models[i], self.cpu_data[i]
         for substep in range(self.substeps):
           applied = target_np[i] if substep >= delay_np[i, 0] else previous_np[i]
           torque = kp_np[i] * (applied - d.qpos[7:]) - kd_np[i] * d.qvel[6:]
@@ -447,6 +458,12 @@ class Q1Simulator:
             m.actuator_ctrlrange[:, 1],
           )
           mujoco.mj_step(m, d)
+
+      if self.cpu_executor is None:
+        for i in range(self.num_envs):
+          step_world(i)
+      else:
+        list(self.cpu_executor.map(step_world, range(self.num_envs)))
       self._sync_cpu()
     self.last_action.copy_(actions)
     if self.robot.modeled_action_delay:

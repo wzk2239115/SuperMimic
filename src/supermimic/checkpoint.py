@@ -42,6 +42,8 @@ def capture_rng(device: str) -> dict[str, Any]:
   }
   if device.startswith("cuda"):
     result["cuda"] = torch.cuda.get_rng_state(device).cpu()
+  elif device == "mps":
+    result["mps"] = torch.mps.get_rng_state().cpu()
   return result
 
 
@@ -56,6 +58,8 @@ def restore_rng(state: dict[str, Any], device: str) -> None:
     if device.startswith("cuda"):
       with torch.cuda.device(device):
         torch.cuda.manual_seed(seed)
+    elif device == "mps":
+      torch.mps.manual_seed(seed)
     return
   random.setstate(state["python"])
   name, keys, position, gaussian, cached = state["numpy"]
@@ -65,6 +69,8 @@ def restore_rng(state: dict[str, Any], device: str) -> None:
   torch.set_rng_state(state["torch"])
   if device.startswith("cuda") and "cuda" in state:
     torch.cuda.set_rng_state(state["cuda"], device)
+  elif device == "mps" and "mps" in state:
+    torch.mps.set_rng_state(state["mps"])
 
 
 def save_checkpoint(

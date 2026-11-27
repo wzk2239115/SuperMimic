@@ -68,3 +68,36 @@ def test_fused_optimizer_request_falls_back_for_cpu(
   )
   for name in ("actor", "model", "critic"):
     assert getattr(learner, f"{name}_optimizer").defaults["fused"] is None
+
+
+def test_time_major_rollout_preserves_policy_and_critic_updates(
+  environment: tuple[Q1Robot, Q1Motions],
+):
+  robot, motions = environment
+  learners = []
+  for enabled in (False, True):
+    torch.manual_seed(121)
+    learner = small_learner(robot, motions, RewardTuningCfg())
+    learner.time_major_rollout = enabled
+    learners.append(learner)
+
+  batch = make_batch(robot, motions, 1)
+  batch.frames[-1] = motions.lengths()[0] - 2
+  metrics = []
+  for learner in learners:
+    torch.manual_seed(77)
+    metrics.append(learner.improve_policy(batch, 2, 2))
+  assert metrics[0] == pytest.approx(metrics[1], rel=1e-5, abs=1e-6)
+
+  first, second = learners
+  for name in ("actor", "critic"):
+    reference, actual = getattr(first, name), getattr(second, name)
+    torch.testing.assert_close(reference.state_dict(), actual.state_dict())
+    for left, right in zip(reference.parameters(), actual.parameters(), strict=True):
+      torch.testing.assert_close(left.grad, right.grad, atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(
+      getattr(first, f"{name}_optimizer").state_dict(),
+      getattr(second, f"{name}_optimizer").state_dict(),
+      atol=1e-6,
+      rtol=1e-5,
+    )
