@@ -169,6 +169,12 @@ done
 
 比较两个输出目录里的 `throughput.json` 和 `metrics.jsonl`。短测先验证兼容性和固定工作量下的扩展效率，下一步可为多卡调大总环境数并按同一动作的跟踪效果评估收益。
 
+### A6000 八卡后续短测
+
+`cuda-bench-scale.example.toml` 将全局仿真环境从 1024 增至 4096，保持学习批量不变。
+`cuda-bench-graph.example.toml` 保持原短测全局规模，同时启用 Inductor 和想象 rollout 的 CUDA Graph。
+两套配置分别与原八卡报告对比。首次编译与捕获的耗时记录在首轮 `update_seconds`，后 15 轮各阶段均值在 `throughput.json`。
+
 ### 复用已有 PyTorch 的 CUDA 容器
 
 对于已提供 CUDA 版 PyTorch 的容器（例如 Python 3.12 和 CUDA 12.8 的 NVIDIA 镜像），可以使用容器内的 Python 和 PyTorch，从源码启动。以下安装只写入当前仓库里的虚拟环境。

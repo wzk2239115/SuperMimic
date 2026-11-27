@@ -1,0 +1,25 @@
+# Eight CUDA ranks, 512 environments per rank and unchanged learner batches.
+[train]
+robot_xml = "../assets/q1_v3/xml/q1_v3_mc.xml"
+motion_dir = "../datasets/train_50hz/motion_yuanke"
+motion_pattern = "*/*.npz"
+output_dir = "../logs/cuda_bench_scale"
+device = "cuda:0"
+motion_storage = "device"
+max_motions = 1
+motion_selection = "first"
+num_envs = 4096
+model_batch_size = 1024
+policy_batch_size = 1024
+iterations = 30
+replay_steps = 128
+model_batches = 2
+critic_epochs = 2
+critic_minibatches = 2
+physics_timestep = 0.002
+runtime_checks = "per_update"
+cache_reference_heads = true
+cache_goals = true
+save_interval = 30
+profile_iterations = 15
+seed = 0
