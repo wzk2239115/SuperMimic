@@ -194,9 +194,13 @@ class SuperMimic:
     cached_goal: Tensor | None = None,
     encoding: Tensor | None = None,
     active: Tensor | None = None,
+    differentiate_value: bool = True,
   ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     goal = goal_features(self.robot, references) if cached_goal is None else cached_goal
-    value = self.critic(state, goal, context)
+    # Intermediate values are detached for GAE. The terminal bootstrap is
+    # evaluated separately and keeps its gradient back to the actor.
+    with torch.set_grad_enabled(torch.is_grad_enabled() and differentiate_value):
+      value = self.critic(state, goal, context)
     action = (
       self.actor(history, goal)
       if encoding is None
@@ -475,6 +479,7 @@ class SuperMimic:
           cached_goals[:, t] if cached_goals is not None else None,
           encoding,
           active,
+          differentiate_value=False,
         )
         states.append(state.detach())
         contexts.append(context.detach())

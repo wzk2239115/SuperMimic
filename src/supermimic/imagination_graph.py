@@ -128,12 +128,13 @@ class ImaginationGraph:
             cached_goals[:, t] if cached_goals is not None else None,
             encodings[:, t].contiguous() if encodings is not None else None,
             active,
+            differentiate_value=False,
           )
         )
         states.append(state.detach())
         contexts.append(context.detach())
         goals.append(goal.detach())
-        values.append(value)
+        values.append(value.detach())
         termination = torch.where(
           inputs.remaining <= t + 1, torch.ones_like(termination), termination
         )
@@ -193,7 +194,7 @@ class ImaginationGraph:
     # Torch 2.7's Stream.__new__ annotation differs between type checkers.
     stream = cast(torch.cuda.Stream, torch.cuda.Stream(device=device))  # ty: ignore[redundant-cast]
     stream.wait_stream(torch.cuda.current_stream(device))
-    # Warmups create compiled forward/backward kernels and autograd grad buffers.
+    # Warmups initialize libraries, any compiled kernels, and grad buffers.
     # They do not update weights; fork_rng restores all consumed exploration RNG.
     with torch.random.fork_rng(devices=[device.index]):
       with torch.cuda.stream(stream):
@@ -223,10 +224,13 @@ class ImaginationGraph:
     if inputs.state.device.type != "cuda":
       self.learner.actor_optimizer.zero_grad(set_to_none=True)
       return self.forward_backward(inputs)
-    if self.learner.compiled_backend != "inductor":
-      raise ValueError("CUDA imagination capture requires Inductor compilation")
     if self.graph is None:
+      if self.learner.distributed.main:
+        backend = self.learner.compiled_backend or "eager"
+        print(f"Capturing the actor CUDA Graph ({backend})", flush=True)
       self._capture(inputs)
+      if self.learner.distributed.main:
+        print("Actor CUDA Graph ready", flush=True)
     assert self.graph is not None and self.static_input is not None
     assert self.static_output is not None
     if self._layout() != self.parameter_layout:

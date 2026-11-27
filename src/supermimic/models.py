@@ -88,6 +88,7 @@ class WorldModel(nn.Module):
   scale: Tensor
   context_scale: Tensor
   termination_scale: Tensor
+  legacy_termination_scale: Tensor
 
   def __init__(
     self,
@@ -100,6 +101,9 @@ class WorldModel(nn.Module):
   ):
     super().__init__()
     self.register_buffer("scale", state_scale(robot))
+    self.register_buffer(
+      "legacy_termination_scale", torch.tensor([0.25, 0.8]), persistent=False
+    )
     self.representation = representation
     if network_profile not in ("legacy", "running_silu"):
       raise ValueError("Unknown network profile")
@@ -209,7 +213,9 @@ class WorldModel(nn.Module):
       return run_mlp(
         self.termination, torch.cat((features, features.abs()), -1), self.mlp_precision
       ).squeeze(-1)
-    features = robot.termination_features(state, target) / state.new_tensor([0.25, 0.8])
+    features = robot.termination_features(
+      state, target
+    ) / self.legacy_termination_scale.to(state)
     return run_mlp(self.termination, features, self.mlp_precision).squeeze(-1)
 
 

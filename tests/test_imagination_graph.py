@@ -125,3 +125,24 @@ def test_tensor_rollout_keeps_analytic_input_gradients_with_frozen_weights(
   assert all(parameter.requires_grad for parameter in learner.critic.parameters())
   assert not output.targets.requires_grad
   assert not output.states.requires_grad and not output.goals.requires_grad
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_eager_cuda_graph_captures_and_reuses_actor_gradients(
+  environment: tuple[Q1Robot, Q1Motions],
+):
+  robot, motions = environment
+  batch = make_batch(robot, motions, 1).to("cuda:0")
+  robot.to("cuda:0")
+  learner = small_learner(robot, motions, RewardTuningCfg(arm_joint_weight=0.05))
+  for module in (learner.model, learner.actor, learner.critic):
+    module.to("cuda:0")
+    module.mlp_precision = "bf16" if torch.cuda.is_bf16_supported() else "fp32"
+  learner.imagination_graph = ImaginationGraph(learner, gae_returns)
+
+  for _ in range(2):
+    results = learner.improve_policy(batch, 1, 1)
+    assert torch.isfinite(torch.tensor(list(results.values()))).all()
+    assert results["actor_grad_norm"] > 0
+  assert learner.compiled_backend is None
+  assert learner.imagination_graph.graph is not None

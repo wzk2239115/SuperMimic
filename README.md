@@ -175,6 +175,21 @@ done
 `cuda-bench-graph.example.toml` 保持原短测全局规模，同时启用 Inductor 和想象 rollout 的 CUDA Graph。
 两套配置分别与原八卡报告对比。首次编译与捕获的耗时记录在首轮 `update_seconds`，后 15 轮各阶段均值在 `throughput.json`。
 
+### A6000 八卡长训
+
+`configs/a6000-8gpu.example.toml` 针对单机 8 张 A6000。每卡 512 个仿真环境，世界模型和策略批量各 256。MLP 使用 BF16，优化器使用 CUDA fused Adam。策略的 32 步 rollout 与反向传播使用 CUDA Graph，默认关闭 Inductor 编译，避免每个 rank 在起步时编译整套内核。第一次捕获时终端会显示 `Capturing the actor CUDA Graph (eager)` 和 `Actor CUDA Graph ready`。
+
+用下面的命令从零开始，继续复用容器的 CUDA PyTorch 环境：
+
+```bash
+export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+.venv-a6000/bin/python -m supermimic launch \
+  --config configs/a6000-8gpu.example.toml --gpus 8 \
+  --output-dir "logs/a6000-train-$(date +%Y%m%d-%H%M%S)"
+```
+
+默认从 Yuanke 动作库选 16 段动作。只训练某一段舞时，把配置复制到同一目录并修改 `motion_dir`、`motion_pattern` 和 `max_motions`。首次运行确认首轮捕获成功，并用后续训练日志中的阶段耗时、仿真步数和显存余量调优。本配置的八卡实测应在目标服务器完成。
+
 ### 复用已有 PyTorch 的 CUDA 容器
 
 对于已提供 CUDA 版 PyTorch 的容器（例如 Python 3.12 和 CUDA 12.8 的 NVIDIA 镜像），可以使用容器内的 Python 和 PyTorch，从源码启动。以下安装只写入当前仓库里的虚拟环境。

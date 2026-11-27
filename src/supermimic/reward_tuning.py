@@ -83,8 +83,10 @@ def reward_tuning_terms(
   A missing context explicitly means nominal motor offsets. When using the
   PD-target prior under domain randomization, pass the current simulator context.
   """
-  indices = _arm_joint_indices(robot)
-  qindices = [7 + i for i in indices]
+  indices = robot.arm_joint_indices
+  if indices.numel() != 8:
+    raise ValueError("Expected Q1 V2's eight shoulder/elbow joints")
+  qindices = indices + 7
   terms: dict[str, Tensor] = {}
   if tuning.body_orientation_std is not None:
     rotations = robot.kinematics(next_state)[1]
@@ -96,14 +98,18 @@ def reward_tuning_terms(
     replacement = (-error / tuning.body_orientation_std**2).exp()
     terms["body_orientation_delta"] = replacement - original
   if tuning.arm_joint_weight:
-    error = (next_state[..., qindices] - target[..., qindices]) / tuning.arm_error_std
+    error = (
+      next_state.index_select(-1, qindices) - target.index_select(-1, qindices)
+    ) / tuning.arm_error_std
     terms["arm_joint_penalty"] = -tuning.arm_joint_weight * error.square().mean(-1)
   if tuning.arm_pd_target_weight:
-    zero = robot.default_q[indices]
+    zero = robot.default_q.index_select(0, indices)
     if context is not None:
-      zero = zero + context[..., robot.context_layout.motor_offset][..., indices]
-    pd_target = zero + tuning.action_scale * action[..., indices]
-    error = (pd_target - target[..., qindices]) / tuning.arm_error_std
+      zero = zero + context[..., robot.context_layout.motor_offset].index_select(
+        -1, indices
+      )
+    pd_target = zero + tuning.action_scale * action.index_select(-1, indices)
+    error = (pd_target - target.index_select(-1, qindices)) / tuning.arm_error_std
     terms["arm_pd_target_penalty"] = -tuning.arm_pd_target_weight * error.square().mean(
       -1
     )

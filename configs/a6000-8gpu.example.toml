@@ -1,0 +1,31 @@
+# 8× RTX A6000. Global counts split into 512 environments and 256/256 batches per GPU.
+[train]
+robot_xml = "../assets/q1_v3/xml/q1_v3_mc.xml"
+motion_dir = "../datasets/train_50hz/motion_yuanke"
+motion_pattern = "*/*.npz"
+output_dir = "../logs/a6000_train"
+device = "cuda:0"
+motion_storage = "device"
+max_motions = 16
+motion_selection = "random"
+num_envs = 4096
+model_batch_size = 2048
+policy_batch_size = 2048
+iterations = 10000
+replay_steps = 1000
+model_batches = 2
+critic_epochs = 2
+critic_minibatches = 2
+physics_timestep = 0.002
+runtime_checks = "per_update"
+cache_reference_heads = true
+cache_goals = true
+capture_imagination = true
+mlp_precision = "bf16"
+fused_optimizers = true
+initial_save_iteration = 20
+save_interval = 500
+profile_every = 25
+profile_iterations = 30
+collective_timeout_seconds = 600
+seed = 0

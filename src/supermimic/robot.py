@@ -139,6 +139,9 @@ class Q1Robot(nn.Module):
   actuator_qindex: Tensor
   actuator_gear: Tensor
   ctrl_limits: Tensor
+  gravity_direction: Tensor
+  identity_rotation: Tensor
+  arm_joint_indices: Tensor
 
   def __init__(
     self,
@@ -229,6 +232,25 @@ class Q1Robot(nn.Module):
     self.register_buffer("joint_axis", torch.tensor(m.jnt_axis, dtype=torch.float32))
     self.register_buffer("joint_anchor", torch.tensor(m.jnt_pos, dtype=torch.float32))
     self.register_buffer("default_q", torch.tensor(m.qpos0[7:], dtype=torch.float32))
+    # Device-resident constants avoid CPU transfers inside CUDA Graph capture.
+    self.register_buffer(
+      "gravity_direction", torch.tensor([0.0, 0.0, -1.0]), persistent=False
+    )
+    self.register_buffer(
+      "identity_rotation", torch.tensor([1.0, 0.0, 0.0, 0.0]), persistent=False
+    )
+    self.register_buffer(
+      "arm_joint_indices",
+      torch.tensor(
+        [
+          i
+          for i, name in enumerate(self.joint_names)
+          if "shoulder" in name or "elbow" in name
+        ],
+        dtype=torch.long,
+      ),
+      persistent=False,
+    )
     self.register_buffer(
       "joint_limits", torch.tensor(m.jnt_range[1:], dtype=torch.float32)
     )
@@ -316,7 +338,7 @@ class Q1Robot(nn.Module):
     q, dq = state[..., 7:29], state[..., 35:57]
     rot = normalize_quat(state[..., 3:7])
     gyro = quat_apply(quat_inverse(rot), state[..., 32:35])
-    gravity = quat_apply(quat_inverse(rot), state.new_tensor([0, 0, -1]))
+    gravity = quat_apply(quat_inverse(rot), self.gravity_direction.to(state))
     return torch.cat(
       (
         q - self.default_q - context[..., self.context_layout.motor_offset],
@@ -340,7 +362,7 @@ class Q1Robot(nn.Module):
     v = state[..., None, 29:32]
     w = state[..., None, 32:35]
     zero = torch.zeros_like(p)
-    identity = state.new_tensor([1, 0, 0, 0]).expand_as(r)
+    identity = self.identity_rotation.to(state).expand_as(r)
     positions, rotations, velocities, angular = (
       [zero, p],
       [identity, r],
@@ -397,7 +419,7 @@ class Q1Robot(nn.Module):
   def _kinematics_serial(self, state: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     shape = state.shape[:-1]
     zero = state.new_zeros((*shape, 3))
-    identity = state.new_tensor([1, 0, 0, 0]).expand(*shape, 4)
+    identity = self.identity_rotation.to(state).expand(*shape, 4)
     positions, rotations, velocities, angular = [zero], [identity], [zero], [zero]
     for body in range(1, self.model.nbody):
       if body == 1:
@@ -495,7 +517,7 @@ class Q1Robot(nn.Module):
     )
 
   def termination_features(self, state: Tensor, target: Tensor) -> Tensor:
-    gravity = state.new_tensor([0, 0, -1])
+    gravity = self.gravity_direction.to(state)
     g = quat_apply(quat_inverse(normalize_quat(state[..., 3:7])), gravity)
     tg = quat_apply(quat_inverse(normalize_quat(target[..., 3:7])), gravity)
     return torch.stack(

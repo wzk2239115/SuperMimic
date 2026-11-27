@@ -19,6 +19,7 @@ from collections.abc import Generator, Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
+from functools import reduce
 from typing import Any, Literal
 
 import torch
@@ -33,6 +34,7 @@ class _GradientPlan:
   parameters: tuple[torch.nn.Parameter, ...]
   present: tuple[bool, ...]
   buckets: list[list[Tensor]]
+  flat_buffers: list[Tensor]
 
 
 @dataclass
@@ -321,7 +323,15 @@ class Distributed:
         for parameter, expected in zip(parameters, present, strict=True)
         if expected
       ]
-      plan = _GradientPlan(parameters, present, _buckets(active, bucket_bytes))
+      buckets = _buckets(active, bucket_bytes)
+      flat_buffers = [
+        bucket[0].new_empty(
+          sum(parameter.numel() for parameter in bucket),
+          dtype=reduce(torch.promote_types, (parameter.dtype for parameter in bucket)),
+        )
+        for bucket in buckets
+      ]
+      plan = _GradientPlan(parameters, present, buckets, flat_buffers)
       self._gradient_plans[key] = plan
     if any(
       (parameter.grad is not None) != expected
@@ -332,12 +342,17 @@ class Distributed:
       [p.grad if p.grad is not None else torch.zeros_like(p) for p in bucket]
       for bucket in plan.buckets
     ]
-    self._reduce_gradient_buckets(gradients)
+    self._reduce_gradient_buckets(gradients, plan.flat_buffers)
 
-  def _reduce_gradient_buckets(self, buckets: list[list[Tensor]]) -> None:
+  def _reduce_gradient_buckets(
+    self, buckets: list[list[Tensor]], buffers: list[Tensor] | None = None
+  ) -> None:
     pending = []
-    for bucket in buckets:
-      flat = torch.cat([grad.reshape(-1) for grad in bucket])
+    for index, bucket in enumerate(buckets):
+      pieces = [grad.reshape(-1) for grad in bucket]
+      flat = (
+        torch.cat(pieces) if buffers is None else torch.cat(pieces, out=buffers[index])
+      )
       pending.append((dist.all_reduce(flat, async_op=True), flat, bucket))
     for handle, flat, bucket in pending:
       handle.wait()
