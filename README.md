@@ -179,6 +179,8 @@ done
 
 `configs/a6000-8gpu.example.toml` 针对单机 8 张 A6000。每卡 512 个仿真环境，世界模型和策略批量各 256。MLP 使用 BF16，优化器使用 CUDA fused Adam。策略的 32 步 rollout 与反向传播使用 CUDA Graph，默认关闭 Inductor 编译，避免每个 rank 在起步时编译整套内核。第一次捕获时终端会显示 `Capturing the actor CUDA Graph (eager)` 和 `Actor CUDA Graph ready`。
 
+先用 `configs/a6000-8gpu-perf.example.toml` 跑 12 轮。它使用相同的训练规模，记录最后 8 轮的阶段耗时。确认性能后再使用长训配置。
+
 用下面的命令从零开始，继续复用容器的 CUDA PyTorch 环境：
 
 ```bash
