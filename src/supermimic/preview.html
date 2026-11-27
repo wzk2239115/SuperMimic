@@ -64,7 +64,7 @@ player.addEventListener("loadedmetadata", () => { player.playbackRate = Number(s
 const degrees = r => (r * 180 / Math.PI).toFixed(1) + "°";
 
 async function show(preview) {
-  const response = await fetch("/video/" + preview.checkpoint + ".mp4");
+  const response = await fetch("./video/" + preview.checkpoint + ".mp4");
   if (!response.ok) return;
   const nextUrl = URL.createObjectURL(await response.blob());
   player.src = nextUrl;
@@ -86,7 +86,7 @@ async function show(preview) {
 }
 async function poll() {
   try {
-    const response = await fetch("/status");
+    const response = await fetch("./status");
     if (!response.ok) throw new Error("Unavailable");
     const data = await response.json();
     byId("progress").textContent = data.iteration == null ? "等待训练日志" : "最新记录 · 第 " + data.iteration + " 轮";
