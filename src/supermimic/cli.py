@@ -12,6 +12,11 @@ COMMANDS = {
   "eval": ("evaluate", "main", "Evaluate checkpoint clips deterministically"),
   "play": ("play", "main", "View or save a policy rollout"),
   "preview": ("preview", "main", "Watch the run in a local training preview"),
+  "preview-gif": (
+    "preview_gif",
+    "main",
+    "Export a checkpoint rollout to GIF and TensorBoard",
+  ),
   "record": ("record", "main", "Record one complete original LAFAN sequence"),
   "watch-videos": ("video_watcher", "cli", "Record periodic checkpoints on CPU"),
   "monitor": ("training_monitor", "cli", "Monitor a run or supervised attempts"),
