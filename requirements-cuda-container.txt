@@ -1,0 +1,8 @@
+# For an existing CUDA-enabled PyTorch container. Keep its Python and PyTorch.
+mujoco==3.6.0
+mujoco-warp @ git+https://github.com/google-deepmind/mujoco_warp@875c4caf06d71b12b2036c327e7a07ce08a78b9a
+warp-lang==1.12.0
+numpy>=2.2,<3
+pillow>=11,<14
+tyro>=1.0
+tensorboard>=2.20
