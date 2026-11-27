@@ -1,6 +1,8 @@
 """Serve a local, automatically refreshed preview of a training run."""
 
 import json
+import os
+import re
 import signal
 import subprocess
 import sys
@@ -9,7 +11,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Event, Thread
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit
 
 import tyro
 
@@ -20,6 +22,8 @@ class Config:
   """Directory where the trainer writes checkpoints and metrics."""
   port: int = 8765
   """Local HTTP port. Use 0 to choose an available port."""
+  notebook_url: str | None = None
+  """Current JupyterLab URL. Print the browser URL through its port proxy."""
   motion_index: int = 0
   """Index of the fixed reference action in the checkpoint's motion list."""
   seconds: int = 6
@@ -172,10 +176,26 @@ class RunPreview:
     return Handler
 
 
+def notebook_base_url(value: str) -> SplitResult:
+  url = urlsplit(value.strip())
+  if (
+    url.scheme not in ("http", "https")
+    or not url.hostname
+    or url.username is not None
+    or url.password is not None
+  ):
+    raise ValueError("Paste the full HTTP(S) URL of the JupyterLab page")
+  path = re.split(r"/(?:lab|tree|notebooks|terminals)(?:/|$)", url.path, maxsplit=1)[0]
+  path = re.sub(r"/proxy/(?:absolute/)?[0-9]+/?$", "", path)
+  return url._replace(path=path.rstrip("/"), query="", fragment="")
+
+
 def main() -> None:
   cfg = tyro.cli(Config)
   if not 0 <= cfg.port <= 65535 or cfg.motion_index < 0 or not 1 <= cfg.seconds <= 30:
     raise ValueError("Use a valid port, nonnegative motion index and 1–30 seconds")
+  notebook_url = cfg.notebook_url or os.environ.get("SUPERMIMIC_NOTEBOOK_URL")
+  public_base = notebook_base_url(notebook_url) if notebook_url else None
   preview = RunPreview(cfg)
 
   def interrupt(*_: object) -> None:
@@ -186,7 +206,12 @@ def main() -> None:
     worker = Thread(target=preview.watch)
     worker.start()
     try:
-      print(f"训练效果预览: http://127.0.0.1:{server.server_port}/", flush=True)
+      print(f"服务器本地预览: http://127.0.0.1:{server.server_port}/", flush=True)
+      if public_base is not None:
+        public = public_base._replace(
+          path=f"{public_base.path}/proxy/{server.server_port}/"
+        )
+        print(f"复制到浏览器: {public.geturl()}", flush=True)
       server.serve_forever()
     except KeyboardInterrupt:
       pass
