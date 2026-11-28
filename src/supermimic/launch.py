@@ -35,6 +35,12 @@ class Config:
   """Print the resolved command without creating a run or initializing CUDA."""
   output_dir: Path | None = None
   """Override the training output directory, relative to the shell."""
+  resume: Path | None = None
+  """Resume a checkpoint instead of the configured initialization, relative to the shell."""
+  max_wall_seconds: int | None = None
+  """Override this invocation's wall-time limit. Use 0 for no wall-time limit."""
+  iterations: int | None = None
+  """Override the cumulative iteration limit, including any resumed iterations."""
   webui: bool = False
   """Serve the current run's action preview on this computer."""
   webui_port: int = 8765
@@ -127,6 +133,18 @@ def main() -> None:
   options = load_options(cfg.config)
   if cfg.output_dir is not None:
     options["output_dir"] = str(cfg.output_dir.expanduser().resolve())
+  if cfg.resume is not None:
+    options.pop("warm_start", None)
+    options.pop("warm_start_progress", None)
+    options["resume"] = str(cfg.resume.expanduser().resolve())
+  if cfg.max_wall_seconds is not None:
+    if cfg.max_wall_seconds < 0:
+      raise ValueError("Maximum wall time must be nonnegative")
+    options["max_wall_seconds"] = cfg.max_wall_seconds
+  if cfg.iterations is not None:
+    if cfg.iterations < 1:
+      raise ValueError("Iterations must be positive")
+    options["iterations"] = cfg.iterations
   command = build_command(options, cfg.gpus)
   print(shlex.join(command), flush=True)
   dashboard = None
