@@ -17,6 +17,7 @@ from supermimic.collection import Q1Collector
 from supermimic.data import Q1Motions
 from supermimic.models import Critic, MotionPolicy, WorldModel, frozen, goal_features
 from supermimic.randomization import nominal_context
+from supermimic.replay import TemporalReplay
 from supermimic.reward_tuning import RewardTuningCfg, tuned_reward
 from supermimic.robot import Q1Robot
 from supermimic.simulator import Q1Simulator
@@ -254,6 +255,7 @@ def training_config(robot: Q1Robot, motions: Q1Motions, output: Path) -> TrainCf
     num_envs=2,
     iterations=1,
     replay_steps=64,
+    motion_cache_dir=output.parent / "motion-cache",
     model_batch_size=2,
     policy_batch_size=2,
     model_batches=1,
@@ -266,6 +268,32 @@ def training_config(robot: Q1Robot, motions: Q1Motions, output: Path) -> TrainCf
     physics_timestep=0.005,
     checkpoint_replay=True,
   )
+
+
+def test_nonfinite_collection_reward_aborts_before_replay(
+  environment: tuple[Q1Robot, Q1Motions],
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+):
+  robot, motions = environment
+  original = Q1Collector._heads
+
+  def bad_reward(self, *args):
+    reward, terminated, observation = original(self, *args)
+    reward[0] = -float("inf")
+    return reward, terminated, observation
+
+  def unexpected_replay(*args):
+    pytest.fail("bad transition reached replay")
+
+  monkeypatch.setattr(Q1Collector, "_heads", bad_reward)
+  monkeypatch.setattr(TemporalReplay, "add", unexpected_replay)
+  output = tmp_path / "bad_reward"
+  with pytest.raises(
+    FloatingPointError, match=r"reward -inf on rank 0, env 0, clip .*reference.npz"
+  ):
+    train(training_config(robot, motions, output))
+  assert not list(output.glob("checkpoint_*.pt"))
 
 
 def test_new_reward_new_data_warm_start_is_a_fresh_cpu_training_run(

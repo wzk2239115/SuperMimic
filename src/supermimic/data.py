@@ -286,8 +286,13 @@ class ReturnResetSampler:
     reachable = (self.lengths[clips.cpu()] - 1 - frames.cpu()).clamp(min=1).float()
     return 5 * self.dt * (1 - self.gamma**reachable) / (1 - self.gamma)
 
+  def _hard_weights(self) -> Tensor:
+    # Shift before scaling so a large finite negative return cannot overflow
+    # into a positive infinite logit. The hardest bin always has zero logit.
+    return torch.softmax(-25 * (self.normalized - self.normalized.min()), dim=0)
+
   def sample(self, count: int) -> tuple[Tensor, Tensor, Tensor]:
-    hard = torch.softmax(-25 * self.normalized, dim=0)
+    hard = self._hard_weights()
     past = self.past_weights / self.past_weights.sum()
     weights = 0.5 / len(hard) + 0.4 * hard + 0.1 * past
     bins = torch.multinomial(weights, count, replacement=True)
@@ -300,7 +305,7 @@ class ReturnResetSampler:
 
   def advance_past(self) -> None:
     """Advance historical difficulty once per iteration, equally on every rank."""
-    self.past_weights += torch.softmax(-25 * self.normalized, dim=0)
+    self.past_weights += self._hard_weights()
 
   def state_dict(self) -> dict[str, Any]:
     return {
@@ -356,6 +361,16 @@ class ReturnResetSampler:
     if reduce is not None:
       shared = reduce(torch.stack((counts, totals)))
       counts, totals = shared[0], shared[1]
+    # Check after the collective so every rank fails on the same invalid
+    # shared totals, before any of them updates the curriculum.
+    bad_bins = (~torch.isfinite(totals)).nonzero().flatten()
+    if len(bad_bins):
+      clips = self.clips[bad_bins[:8]].tolist()
+      starts = self.starts[bad_bins[:8]].tolist()
+      raise FloatingPointError(
+        f"Nonfinite curriculum returns in {len(bad_bins)} bins; "
+        f"first (clip index, bin start frame): {list(zip(clips, starts, strict=True))}"
+      )
     touched = counts > 0
     retained = self.momentum ** counts[touched]
     observed = totals[touched] / counts[touched]

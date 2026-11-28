@@ -515,6 +515,20 @@ def _train(
         simulator.context,
         history[:, -1, -22:] if cfg.clean_policy_actions else None,
       )
+    with group.timed("collection_readback"):
+      trace_bins = sampler.bin_ids(clips, frames).tolist()
+      trace_ceilings = sampler.frame_ceiling(clips, frames).tolist()
+      rewards = reward.cpu().tolist()
+    for index, value in enumerate(rewards):
+      if not math.isfinite(value):
+        clip, frame = int(clips[index]), int(frames[index])
+        raise FloatingPointError(
+          f"Nonfinite collection reward {value} on rank {group.rank}, "
+          f"env {index}, clip {paths[clip]}, reference frame {frame}; "
+          f"max |action|={float(executed[index].abs().max()):.6g}, "
+          f"max |previous action|={float(state[index, 57:79].abs().max()):.6g}, "
+          f"max |physical state|={float(next_state[index, :57].abs().max()):.6g}"
+        )
     boundary = terminated | (frames + 1 >= length_device[clips] - 1)
     replay.add(
       state,
@@ -527,10 +541,6 @@ def _train(
       clips,
       frames,
     )
-    with group.timed("collection_readback"):
-      trace_bins = sampler.bin_ids(clips, frames).tolist()
-      trace_ceilings = sampler.frame_ceiling(clips, frames).tolist()
-      rewards = reward.cpu().tolist()
     for index, (bin_id, ceiling, value) in enumerate(
       zip(trace_bins, trace_ceilings, rewards, strict=True)
     ):
@@ -550,7 +560,7 @@ def _train(
           pending_progress.append(future / ceiling)
       with group.timed("reset_worlds"):
         reset(ids)
-    return float(reward.mean())
+    return math.fsum(rewards) / len(rewards)
 
   def flush_curriculum() -> None:
     """Apply the buffered reset statistics, exactly once per iteration.

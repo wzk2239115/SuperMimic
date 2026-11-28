@@ -63,6 +63,29 @@ def test_reset_sampling_does_not_mutate_shared_history():
     torch.testing.assert_close(getattr(first, name), getattr(second, name))
 
 
+def test_reset_sampler_rejects_nonfinite_shared_returns_before_mutating():
+  sampler = ReturnResetSampler(torch.tensor([100, 160]), 0.02)
+  before = sampler.state_dict()
+
+  def reduce_with_bad_remote_return(values):
+    values[0, 2] += 1
+    values[1, 2] = -float("inf")
+    return values
+
+  with pytest.raises(FloatingPointError, match=r"1 bins.*\(1, 0\)"):
+    sampler.update(torch.tensor([0]), torch.tensor([0.5]), reduce_with_bad_remote_return)
+  for name in ("normalized", "counts", "past_weights"):
+    torch.testing.assert_close(getattr(sampler, name), before[name])
+
+
+def test_reset_sampler_handles_large_finite_difficulty():
+  sampler = ReturnResetSampler(torch.tensor([100]), 0.02)
+  sampler.normalized[:] = torch.tensor([-1e38, 1e38])
+  sampler.advance_past()
+  assert torch.isfinite(sampler.past_weights).all()
+  assert len(sampler.sample(10)[0]) == 10
+
+
 def test_atomic_checkpoint_failure_preserves_previous_file(tmp_path: Path, monkeypatch):
   path = tmp_path / "checkpoint.pt"
   atomic_save({"value": 1}, path)
