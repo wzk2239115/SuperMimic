@@ -1,0 +1,59 @@
+# Flat-ground pilot. Paths are relative to datasets/train_50hz.
+# Candidate set for simulation training; actions still need closed-loop evaluation.
+# Nine original references.
+motion_lafan/simple_motion/walk1_subject2.npz
+motion_lafan/complex_motion/walk2_subject4.npz
+motion_lafan/complex_motion/walk3_subject2.npz
+motion_lafan/simple_motion/walk4_subject1.npz
+motion_lafan/complex_motion/run1_subject2.npz
+motion_lafan/complex_motion/run2_subject1.npz
+motion_lafan/complex_motion/jumps1_subject5.npz
+motion_lafan/complex_motion/dance1_subject3.npz
+motion_lafan/complex_motion/ground2_subject2.npz
+
+# Five extra labeled LaFAN references. Static screen reported collision / floor penetration.
+motion_lafan/complex_motion/walk3_subject5.npz
+motion_lafan/complex_motion/run1_subject5.npz
+motion_lafan/complex_motion/run2_subject4.npz
+motion_lafan/complex_motion/sprint1_subject2.npz
+motion_lafan/complex_motion/jumps1_subject1.npz
+
+# 24 AMASS candidates that passed the static screen; semantic labels unverified.
+motion_amass/simple_motion/80_10_stageii.npz
+motion_amass/simple_motion/143_23_stageii.npz
+motion_amass/simple_motion/79_58_stageii.npz
+motion_amass/simple_motion/80_21_stageii.npz
+motion_amass/simple_motion/79_30_stageii.npz
+motion_amass/simple_motion/122_19_stageii.npz
+motion_amass/simple_motion/15_08_stageii.npz
+motion_amass/simple_motion/28_01_stageii.npz
+motion_amass/simple_motion/122_68_stageii.npz
+motion_amass/simple_motion/106_16_stageii.npz
+motion_amass/simple_motion/41_11_stageii.npz
+motion_amass/simple_motion/106_13_stageii.npz
+motion_amass/simple_motion/141_16_stageii.npz
+motion_amass/simple_motion/143_27_stageii.npz
+motion_amass/simple_motion/111_26_stageii.npz
+motion_amass/simple_motion/41_10_stageii.npz
+motion_amass/simple_motion/24_01_stageii.npz
+motion_amass/simple_motion/62_12_stageii.npz
+motion_amass/simple_motion/111_25_stageii.npz
+motion_amass/simple_motion/30_19_stageii.npz
+motion_amass/simple_motion/62_04_stageii.npz
+motion_amass/simple_motion/27_11_stageii.npz
+motion_amass/simple_motion/140_06_stageii.npz
+motion_amass/simple_motion/141_21_stageii.npz
+
+# 12 moving AMASS candidates with floor-penetration review flags only.
+motion_amass/complex_motion/127_03_stageii.npz
+motion_amass/complex_motion/127_26_stageii.npz
+motion_amass/complex_motion/108_19_stageii.npz
+motion_amass/complex_motion/108_20_stageii.npz
+motion_amass/complex_motion/91_39_stageii.npz
+motion_amass/complex_motion/105_39_stageii.npz
+motion_amass/complex_motion/38_03_stageii.npz
+motion_amass/complex_motion/105_40_stageii.npz
+motion_amass/complex_motion/91_51_stageii.npz
+motion_amass/complex_motion/143_02_stageii.npz
+motion_amass/complex_motion/120_16_stageii.npz
+motion_amass/complex_motion/75_04_stageii.npz

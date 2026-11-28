@@ -1,0 +1,33 @@
+# Eight-rank warm start on 50 flat-ground references, including the original nine.
+[train]
+robot_xml = "../assets/q1_v3/xml/q1_v3_mc.xml"
+motion_dir = "../datasets/train_50hz"
+motion_manifest = "q1-basic-50.txt"
+output_dir = "../logs/q1-basic-50"
+device = "cuda:0"
+motion_storage = "device"
+max_motions = 0
+num_envs = 8192
+model_batch_size = 2048
+policy_batch_size = 2048
+iterations = 250000
+max_wall_seconds = 32400
+replay_steps = 1000
+model_batches = 2
+critic_epochs = 2
+critic_minibatches = 2
+physics_timestep = 0.002
+runtime_checks = "per_update"
+cache_reference_heads = true
+cache_goals = true
+capture_imagination = true
+capture_reset = true
+mlp_precision = "bf16"
+fused_optimizers = true
+initial_save_iteration = 20
+save_interval = 4000
+profile_every = 250
+profile_iterations = 30
+collective_timeout_seconds = 600
+seed = 0
+warm_start = "../logs/q1-nine-9h-20261128-005511/checkpoint_88830.pt"
